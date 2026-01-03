@@ -1,0 +1,1 @@
+* Use DEBUG_SERIAL instead of Serial for printing any debug statements
