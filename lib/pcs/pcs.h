@@ -159,6 +159,7 @@ public:
   // Pass-through struct-level accessors to PCSCan status
   static const ChargerStatus& get_charger_status() { return PCSCan::get_charger_status(); }
   static const DCDCStatus& get_dcdc_status() { return PCSCan::get_dcdc_status(); }
+  static const DCDCBusStatus& get_dcdc_bus_status() { return PCSCan::get_dcdc_bus_status(); }
   static const ACStatus& get_ac_status() { return PCSCan::get_ac_status(); }
   static const TemperatureData& get_temperature_data() { return PCSCan::get_temperature_data(); }
   static const VoltageData& get_voltage_data() { return PCSCan::get_voltage_data(); }

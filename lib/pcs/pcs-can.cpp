@@ -45,15 +45,39 @@ ControlParams PCSCan::control_params = {
 };
 
 ChargerStatus PCSCan::charger_status = {
-  .hw_type = PCS_HW_11KW,
-  .status = PCS_STATUS_INIT,
+  .main_state = PCS_STATUS_INIT,
+  .charge_status = CHARGE_STATUS_IDLE,
   .grid_config = PCS_GRID_NONE,
-  .power_available_kw = 0.0f
+  .phase_a_enabled = false,
+  .phase_b_enabled = false,
+  .phase_c_enabled = false,
+  .instant_power_available_kw = 0.0f,
+  .max_power_available_kw = 0.0f,
+  .phase_a_current_request_a = 0.0f,
+  .phase_b_current_request_a = 0.0f,
+  .phase_c_current_request_a = 0.0f,
+  .pwm_enable = false
 };
 
 DCDCStatus PCSCan::dcdc_status = {
   .current_a = 0.0f,
-  .power_w = 0.0f
+  .power_w = 0.0f,
+  .precharge_status = DCDC_STATUS_IDLE,
+  .support_12v_status = DCDC_STATUS_IDLE,
+  .hvbus_discharge_status = DCDC_STATUS_IDLE,
+  .main_state = DCDC_STATE_STANDBY,
+  .sub_state = 0,
+  .faulted = false,
+  .output_limited = false,
+  .max_output_current_a = 0.0f,
+  .pwm_enable = false,
+  .supporting_fixed_lv = false
+};
+
+DCDCBusStatus PCSCan::dcdc_bus_status = {
+  .lv_bus_voltage_v = 0.0f,
+  .hv_bus_voltage_v = 0.0f,
+  .lv_output_current_a = 0.0f
 };
 
 ACStatus PCSCan::ac_status = {
@@ -64,13 +88,11 @@ ACStatus PCSCan::ac_status = {
 };
 
 TemperatureData PCSCan::temperature_data = {
-  .local_c = 0,
-  .ambient_raw = 0,
-  .phase_a_raw = 0,
-  .phase_b_raw = 0,
-  .phase_c_raw = 0,
-  .dcdc_raw = 0,
-  .dcdc_b_c = 0.0f
+  .phase_a_c = 0.0f,
+  .phase_b_c = 0.0f,
+  .phase_c_c = 0.0f,
+  .dcdc_c = 0.0f,
+  .ambient_c = 0.0f
 };
 
 VoltageData PCSCan::voltage_data = {
@@ -120,51 +142,17 @@ void PCSCan::begin(CANBus *ipc_can_bus) {
 
 void PCSCan::process_messages() {
   if (can_bus == nullptr) return;
-
-  static uint32_t lastDebugTime = 0;
-  static uint32_t messageCount = 0;
   
   uint32_t can_id;
   uint8_t data[8];
   uint8_t len;
 
   while (can_bus->receiveMessage(can_id, data, len)) {
-    messageCount++;
     
     uint32_t data_words[2];
     memcpy(data_words, data, 8);
     process_frame(can_id, data_words);
   }
-  
-  // Debug: Print message count and error stats every 5 seconds
-  #if DEBUG_PCS_CAN
-  if (millis() - lastDebugTime > 5000) {
-    DEBUG_SERIAL.printf("CAN1 (IPC): PCS_Enable=%s\n", PCSController::is_pcs_enabled() ? "true" : "false");
-    
-    // Get error counters
-    uint8_t txErrors, rxErrors;
-    can_bus->getErrorCounters(txErrors, rxErrors);
-    
-    if (messageCount > 0) {
-      DEBUG_SERIAL.printf("CAN1 (IPC): Received %lu messages in last 5 sec (TX_ERR=%d, RX_ERR=%d)\n", 
-        messageCount, txErrors, rxErrors);
-    } else {
-      DEBUG_SERIAL.printf("CAN1 (IPC): No messages received (TX_ERR=%d, RX_ERR=%d)\n", txErrors, rxErrors);
-      
-      // Show detailed status if errors detected or no messages
-      if (txErrors > 0 || rxErrors > 0) {
-        DEBUG_SERIAL.println("CAN1 (IPC) Status:");
-        can_bus->printStatus();
-      } else {
-        DEBUG_SERIAL.println("  PCS may be offline or not transmitting");
-      }
-    }
-    
-    // Reset counters
-    messageCount = 0;
-    lastDebugTime = millis();
-  }
-  #endif
 }
 
 void PCSCan::process_frame(uint32_t can_id, uint32_t data[2]) {
@@ -175,6 +163,7 @@ void PCSCan::process_frame(uint32_t can_id, uint32_t data[2]) {
     case 0x224: handle224(data); break;
     case 0x264: handle264(data); break;
     case 0x2A4: handle2A4(data); break;
+    case 0x2B4: handle2B4(data); break;
     case 0x2C4: handle2C4(data); break;
     case 0x3A4: handle3A4(data); break;
     case 0x424: handle424(data); break;
@@ -187,38 +176,163 @@ void PCSCan::process_frame(uint32_t can_id, uint32_t data[2]) {
 // CAN Message Reception Handlers (from reference implementation)
 
 void PCSCan::handle204(uint32_t data[2]) {
+  // DBC: PCS_chgStatus (0x204 / 516)
+  // Contains charger state machine status and operational flags
   uint8_t* bytes = (uint8_t*)data;
-  charger_status.hw_type = (PCSHardwareType)((bytes[7] >> 3) & 0x03);
-  charger_status.status = (PCSChargeStatus)((bytes[0]) & 0x0f);
-  charger_status.power_available_kw = bytes[3] * 0.1f;
-  charger_status.grid_config = (PCSGridConfig)((bytes[0] >> 6) & 0x3);
+
+  // PCS_chgMainState (bits 0-3)
+  charger_status.main_state = (PCSChargeStatus)(bytes[0] & 0x0F);
+
+  // PCS_chargeStatus (bits 4-5)
+  charger_status.charge_status = (ChargeStatusFlag)((bytes[0] >> 4) & 0x03);
+
+  // PCS_gridConfig (bits 6-7)
+  charger_status.grid_config = (PCSGridConfig)((bytes[0] >> 6) & 0x03);
+
+  // PCS_chgPHAEnable (bit 8)
+  charger_status.phase_a_enabled = (bytes[1] >> 0) & 0x01;
+
+  // PCS_chgPHBEnable (bit 9)
+  charger_status.phase_b_enabled = (bytes[1] >> 1) & 0x01;
+
+  // PCS_chgPHCEnable (bit 10)
+  charger_status.phase_c_enabled = (bytes[1] >> 2) & 0x01;
+
+  // PCS_chgInstantAcPowerAvailable (bits 16-23, scale 0.1 kW)
+  charger_status.instant_power_available_kw = bytes[2] * 0.1f;
+
+  // PCS_chgMaxAcPowerAvailable (bits 24-31, scale 0.1 kW)
+  charger_status.max_power_available_kw = bytes[3] * 0.1f;
+
+  // PCS_chgPHALineCurrentRequest (bits 32-39, scale 0.1 A)
+  charger_status.phase_a_current_request_a = bytes[4] * 0.1f;
+
+  // PCS_chgPHBLineCurrentRequest (bits 40-47, scale 0.1 A)
+  charger_status.phase_b_current_request_a = bytes[5] * 0.1f;
+
+  // PCS_chgPHCLineCurrentRequest (bits 48-55, scale 0.1 A)
+  charger_status.phase_c_current_request_a = bytes[6] * 0.1f;
+
+  // PCS_chgPwmEnableLine (bit 56)
+  charger_status.pwm_enable = (bytes[7] >> 0) & 0x01;
 }
 
 void PCSCan::handle224(uint32_t data[2]) {
+  // DBC: PCS_dcdcStatus (0x224 / 548)
+  // Contains DCDC state machine status and operational flags
+  // 
+  // NOTE: DCDC current/voltage is read from 0x2B4 (PCS_dcdcBusStatus)
+  // which provides accurate readings on 2017 hardware.
   uint8_t* bytes = (uint8_t*)data;
-  dcdc_status.current_a = (((bytes[3] << 8 | bytes[2]) & 0xFFF) * 0.1f);
-  dcdc_status.power_w = dcdc_status.current_a * voltage_data.lv_v;
+  
+  // Parse status flags per DBC
+  // PCS_dcdcPrechargeStatus (bits 0-1)
+  dcdc_status.precharge_status = (DCDCStatusFlag)(bytes[0] & 0x03);
+  
+  // PCS_dcdc12VSupportStatus (bits 2-3)
+  dcdc_status.support_12v_status = (DCDCStatusFlag)((bytes[0] >> 2) & 0x03);
+  
+  // PCS_dcdcHvBusDischargeStatus (bits 4-5)
+  dcdc_status.hvbus_discharge_status = (DCDCStatusFlag)((bytes[0] >> 4) & 0x03);
+  
+  // PCS_dcdcMainState (bits 6-9)
+  dcdc_status.main_state = (DCDCMainState)((bytes[1] << 2 | bytes[0] >> 6) & 0x0F);
+  
+  // PCS_dcdcSubState (bits 10-14)
+  dcdc_status.sub_state = (bytes[1] >> 2) & 0x1F;
+  
+  // PCS_dcdcFaulted (bit 15)
+  dcdc_status.faulted = (bytes[1] >> 7) & 0x01;
+  
+  // PCS_dcdcOutputIsLimited (bit 28)
+  dcdc_status.output_limited = (bytes[3] >> 4) & 0x01;
+  
+  // PCS_dcdcMaxOutputCurrentAllowed (bits 29-40, scale 0.1)
+  uint16_t raw_max_current = ((bytes[5] << 8 | bytes[4]) >> 5) & 0xFFF;
+  dcdc_status.max_output_current_a = raw_max_current * 0.1f;
+  
+  // PCS_dcdcPwmEnableLine (bit 52)
+  dcdc_status.pwm_enable = (bytes[6] >> 4) & 0x01;
+  
+  // PCS_dcdcSupportingFixedLvTarget (bit 53)
+  dcdc_status.supporting_fixed_lv = (bytes[6] >> 5) & 0x01;
 }
 
 void PCSCan::handle264(uint32_t data[2]) {
+  // DBC: PCS_chgLineStatus (0x264 / 612)
+  // Contains AC line measurements and limits
   uint8_t* bytes = (uint8_t*)data;
-  ac_status.current_limit_a = (((bytes[5] << 8 | bytes[4]) & 0x3ff) * 0.1f);
-  ac_status.power_kw = ((bytes[3]) * 0.1f);
-  ac_status.voltage_v = (((bytes[1] << 8 | bytes[0]) & 0x3FFF) * 0.033f);
-  ac_status.current_a = (((bytes[2] << 9 | bytes[1]) >> 7) * 0.1f);
+
+  // PCS_chgInputVoltage (bits 0-13, 14 bits, scale 0.033)
+  ac_status.voltage_v = ((bytes[1] << 8 | bytes[0]) & 0x3FFF) * 0.033f;
+
+  // PCS_chgLineCurrent (bits 14-22, 9 bits, scale 0.1)
+  ac_status.current_a = (((bytes[2] << 8 | bytes[1]) >> 6) & 0x1FF) * 0.1f;
+
+  // PCS_chgInputPower (bits 24-31, 8 bits, scale 0.1)
+  ac_status.power_kw = bytes[3] * 0.1f;
+
+  // PCS_chgAcCurrentLimit (bits 32-41, 10 bits, scale 0.1)
+  ac_status.current_limit_a = ((bytes[5] << 8 | bytes[4]) & 0x3FF) * 0.1f;
 }
 
 void PCSCan::handle2A4(uint32_t data[2]) {
+  // DBC: PCS_thermalStatus (0x2A4 / 676)
+  // All temperatures: 11-bit signed, scale 0.1, offset +40°C
+  // Formula: temp_C = raw * 0.1 + 40
   uint8_t* bytes = (uint8_t*)data;
-  temperature_data.phase_a_raw = ((bytes[1] << 8 | bytes[0]));
-  temperature_data.phase_b_raw = ((bytes[2] << 8 | bytes[1]) >> 3);
-  temperature_data.phase_c_raw = ((bytes[4] << 15 | bytes[3] << 7 | bytes[2] >> 1) >> 5);
-  temperature_data.dcdc_raw = ((bytes[5] << 8 | bytes[4]) >> 1);
-  temperature_data.dcdc_b_c = (((bytes[7] << 8 | bytes[6]) >> 7) & 0x1FF) * 0.293542f;
-  temperature_data.ambient_raw = ((bytes[6] << 8 | bytes[5]) >> 4);
 
-  // Process temperatures
-  temperature_data.local_c = process_temp(temperature_data.phase_a_raw);
+  // Extract 11-bit values per DBC bit positions
+  // PCS_chgPhATemp:  bits 0-10
+  // PCS_chgPhBTemp:  bits 11-21
+  // PCS_chgPhCTemp:  bits 24-34 (note: gap at 22-23)
+  // PCS_dcdcTemp:    bits 35-45
+  // PCS_ambientTemp: bits 48-58
+
+  uint16_t raw_a = (bytes[1] << 8 | bytes[0]) & 0x7FF;
+  uint16_t raw_b = ((bytes[2] << 8 | bytes[1]) >> 3) & 0x7FF;
+  uint16_t raw_c = ((bytes[4] << 8 | bytes[3]) >> 0) & 0x7FF;
+  uint16_t raw_dcdc = ((bytes[5] << 8 | bytes[4]) >> 3) & 0x7FF;
+  uint16_t raw_ambient = ((bytes[7] << 8 | bytes[6]) >> 0) & 0x7FF;
+
+  // Convert to °C using DBC formula
+  temperature_data.phase_a_c = convert_temp_11bit(raw_a);
+  temperature_data.phase_b_c = convert_temp_11bit(raw_b);
+  temperature_data.phase_c_c = convert_temp_11bit(raw_c);
+  temperature_data.dcdc_c = convert_temp_11bit(raw_dcdc);
+  temperature_data.ambient_c = convert_temp_11bit(raw_ambient);
+}
+
+void PCSCan::handle2B4(uint32_t data[2]) {
+  // DBC: PCS_dcdcBusStatus (0x2B4 / 692)
+  // PCS_dcdcLvBusVolt:      bits 0-9 (10 bits), scale 0.0390625
+  // PCS_dcdcHvBusVolt:      bits 10-21 (12 bits), scale 0.146484375
+  // PCS_dcdcLvOutputCurrent: bits 24-35 (12 bits), scale 0.1
+  // 
+  // NOTE: This message provides accurate voltage/current on 2017 PCS
+  // where 0x2C4 (mux 0xE6/0xC6) returns 0.0V for LV voltage.
+  // We update both dcdc_bus_status (for debugging) and the primary
+  // voltage_data/dcdc_status structs (for parameters).
+  uint8_t* bytes = (uint8_t*)data;
+
+  // Extract 10-bit LV voltage (bits 0-9)
+  uint16_t raw_lv_volt = (bytes[1] << 8 | bytes[0]) & 0x3FF;
+  float lv_voltage = raw_lv_volt * 0.0390625f;
+  dcdc_bus_status.lv_bus_voltage_v = lv_voltage;
+  voltage_data.lv_v = lv_voltage;  // Update primary LV voltage
+
+  // Extract 12-bit HV voltage (bits 10-21)
+  uint16_t raw_hv_volt = ((bytes[2] << 8 | bytes[1]) >> 2) & 0xFFF;
+  float hv_voltage = raw_hv_volt * 0.146484375f;
+  dcdc_bus_status.hv_bus_voltage_v = hv_voltage;
+  voltage_data.hv_v = (uint16_t)hv_voltage;  // Update primary HV voltage
+
+  // Extract 12-bit LV current (bits 24-35)
+  uint16_t raw_lv_current = ((bytes[4] << 8 | bytes[3]) >> 0) & 0xFFF;
+  float lv_current = raw_lv_current * 0.1f;
+  dcdc_bus_status.lv_output_current_a = lv_current;
+  dcdc_status.current_a = lv_current;  // Update primary DCDC current
+  dcdc_status.power_w = lv_current * lv_voltage;  // Update power calculation
 }
 
 void PCSCan::handle2C4(uint32_t data[2]) {
@@ -639,9 +753,22 @@ uint8_t PCSCan::calc_checksum(uint8_t *bytes, uint16_t id) {
   return (uint8_t)checksum_calc;
 }
 
-int16_t PCSCan::process_temp(uint16_t in_val) {
-  int16_t value = in_val & 0x3ff;
-  if (in_val & 0x400) value -= 0x3ff;
-  value = value * 0.1f + 40;
-  return value;
+// Convert 11-bit signed raw value to temperature in °C
+// DBC: scale 0.1, offset +40
+// Formula: temp_C = raw * 0.1 + 40
+// Special value 1023 (0x3FF) = SNA (Signal Not Available)
+float PCSCan::convert_temp_11bit(uint16_t raw) {
+  // Check for SNA value
+  if ((raw & 0x7FF) == 0x3FF) {
+    return -999.0f;  // Return invalid marker
+  }
+
+  // Sign extend 11-bit to 16-bit (2's complement)
+  int16_t signed_val = raw & 0x7FF;
+  if (signed_val & 0x400) {
+    signed_val |= 0xF800;  // Sign extend
+  }
+
+  // Apply DBC conversion: scale 0.1, offset +40
+  return (signed_val * 0.1f) + 40.0f;
 }

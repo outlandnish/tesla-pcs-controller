@@ -458,7 +458,7 @@ bool PCSController::emergency_stop_async() {
 
 void PCSController::run_state_machine() {
   // Get charger status from CAN
-  uint8_t pcs_charge_status = PCSCan::get_charger_status().status;
+  uint8_t pcs_charge_status = PCSCan::get_charger_status().main_state;
 
   #if DEBUG_PCS_STATE
   static PCSState last_logged_state = PCS_STATE_INIT;
@@ -477,6 +477,7 @@ void PCSController::run_state_machine() {
     const ACStatus& ac = PCSCan::get_ac_status();
     const DCCurrentData& dc = PCSCan::get_dc_current_data();
     const DCDCStatus& dcdc = PCSCan::get_dcdc_status();
+    const DCDCBusStatus& dcdc_bus = PCSCan::get_dcdc_bus_status();
     const TemperatureData& temp = PCSCan::get_temperature_data();
     const ChargerStatus& charger = PCSCan::get_charger_status();
     
@@ -488,12 +489,22 @@ void PCSController::run_state_machine() {
                         ac.current_a, ac.voltage_v, ac.power_kw, ac.current_limit_a);
     DEBUG_SERIAL.printf("  DC: %.1fA (A:%.1f B:%.1f C:%.1f)\r\n",
                         dc.total_a, dc.phase_a_a, dc.phase_b_a, dc.phase_c_a);
-    DEBUG_SERIAL.printf("  DCDC: %.1fA %.1fW\r\n",
-                        dcdc.current_a, dcdc.power_w);
-    DEBUG_SERIAL.printf("  Temp: %dC (DCDC_B: %.1fC)\r\n",
-                        temp.local_c, temp.dcdc_b_c);
-    DEBUG_SERIAL.printf("  Charger: hw=%d avail=%.1fkW\r\n",
-                        charger.hw_type, charger.power_available_kw);
+    DEBUG_SERIAL.printf("  DCDC: %.1fA %.1fW state=%d sub=%d fault=%d\r\n",
+                        dcdc.current_a, dcdc.power_w, dcdc.main_state, dcdc.sub_state, dcdc.faulted);
+    DEBUG_SERIAL.printf("    Prech=%d 12V=%d Disch=%d Lim=%d(%.1fA) PWM=%d\r\n",
+                        dcdc.precharge_status, dcdc.support_12v_status, dcdc.hvbus_discharge_status,
+                        dcdc.output_limited, dcdc.max_output_current_a, dcdc.pwm_enable);
+    DEBUG_SERIAL.printf("  DCDC Bus (0x2B4): HV=%.1fV LV=%.1fV I=%.1fA\r\n",
+                        dcdc_bus.hv_bus_voltage_v, dcdc_bus.lv_bus_voltage_v, dcdc_bus.lv_output_current_a);
+    DEBUG_SERIAL.printf("  Temp: PhA=%.1fC PhB=%.1fC PhC=%.1fC DCDC=%.1fC Amb=%.1fC\r\n",
+                        temp.phase_a_c, temp.phase_b_c, temp.phase_c_c, temp.dcdc_c, temp.ambient_c);
+    DEBUG_SERIAL.printf("  Charger: state=%d status=%d grid=%d avail=%.1f/%.1fkW PWM=%d\r\n",
+                        charger.main_state, charger.charge_status, charger.grid_config,
+                        charger.instant_power_available_kw, charger.max_power_available_kw, charger.pwm_enable);
+    DEBUG_SERIAL.printf("    Phases: A=%d(%.1fA) B=%d(%.1fA) C=%d(%.1fA)\r\n",
+                        charger.phase_a_enabled, charger.phase_a_current_request_a,
+                        charger.phase_b_enabled, charger.phase_b_current_request_a,
+                        charger.phase_c_enabled, charger.phase_c_current_request_a);
     last_state_log = millis();
   }
   #endif

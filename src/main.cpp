@@ -360,10 +360,9 @@ void updateParameters() {
 
   // Get charger status from PCS
   const ChargerStatus& chgStatus = PCSController::get_charger_status();
-  Param::SetInt(Param::CHG_STAT, chgStatus.status);
-  Param::SetInt(Param::PCS_Type, chgStatus.hw_type);
+  Param::SetInt(Param::CHG_STAT, chgStatus.main_state);
   Param::SetInt(Param::GridCFG, chgStatus.grid_config);
-  Param::SetFloat(Param::CHGPAvail, chgStatus.power_available_kw);
+  Param::SetFloat(Param::CHGPAvail, chgStatus.max_power_available_kw);
 
   // Get AC status
   const ACStatus& acStatus = PCSController::get_ac_status();
@@ -386,12 +385,12 @@ void updateParameters() {
   const DCCurrentData& dcCurrent = PCSController::get_dc_current_data();
   Param::SetFloat(Param::idc, dcCurrent.total_a);
 
-  // Get temperature data (raw values, need conversion)
+  // Get temperature data (already converted to °C per DBC)
   const TemperatureData& temps = PCSController::get_temperature_data();
-  Param::SetFloat(Param::ChgATemp, temps.phase_a_raw * 0.1f - 40.0f);  // Convert raw to °C
-  Param::SetFloat(Param::ChgBTemp, temps.phase_b_raw * 0.1f - 40.0f);
-  Param::SetFloat(Param::ChgCTemp, temps.phase_c_raw * 0.1f - 40.0f);
-  Param::SetFloat(Param::DCDCTemp, temps.dcdc_raw * 0.1f - 40.0f);
+  Param::SetFloat(Param::ChgATemp, temps.phase_a_c);
+  Param::SetFloat(Param::ChgBTemp, temps.phase_b_c);
+  Param::SetFloat(Param::ChgCTemp, temps.phase_c_c);
+  Param::SetFloat(Param::DCDCTemp, temps.dcdc_c);
   
   // Re-enable interrupts
   taskEXIT_CRITICAL();
