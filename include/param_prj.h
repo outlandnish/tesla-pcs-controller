@@ -63,8 +63,10 @@
   PARAM_ENTRY(CAT_CHARGER, "Time Limit", timelim, "minutes", -1, 10000, -1, 8) \
   PARAM_ENTRY(CAT_CHARGER, "Input Type", inputype, INPUTS, 0, 3, 0, 10) \
   PARAM_ENTRY(CAT_CHARGER, "Activate Devices", activate, DEVS, 0, 3, 3, 14) \
+  PARAM_ENTRY(CAT_CHARGER, "PCS Region", pcstype, PCSREGION, 0, 1, 0, 13) \
   PARAM_ENTRY(CAT_DCDC, "DC/DC Voltage", udcdc, "V", 12, 15, UDCDC_DEFAULT, 15) \
   PARAM_ENTRY(CAT_DCDC, "Precharge Time", PreChT, "sec", 1, 10, 3, 23) \
+  PARAM_ENTRY(CAT_DIAG, "Mode Control", modectl, OPMODES, 0, 2, 0, 30) \
   VALUE_ENTRY("Operating Mode", opmode, OPMODES, 2000) \
   VALUE_ENTRY("State", state, STATES, 2001) \
   VALUE_ENTRY("Last Error", lasterr, "", 2002) \
@@ -99,6 +101,7 @@
 /***** Enum String definitions *****/
 #define OPMODES "0=Off, 1=Run, 2=Drive"
 #define OFFON "0=Off, 1=On"
+#define PCSREGION "0=US, 1=EU"
 #define TYPES "0=48A_1P, 1=32A_1P, 2=16A_3P"
 #define GCFG "0=None, 1=1P, 2=3P, 3=3PD"
 #define STATES "0=Off, 1=WaitStart, 2=Enable, 3=Activate, 4=Run, 5=Stop, 6=DRIVE"
@@ -110,6 +113,7 @@
 #define CAT_CHARGER "Charger"
 #define CAT_DCDC "DC/DC Converter"
 #define CAT_GEN "General"
+#define CAT_DIAG "Diagnostic"
 
 /***** enums ******/
 enum inputs {

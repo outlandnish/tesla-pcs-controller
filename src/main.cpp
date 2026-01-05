@@ -12,11 +12,12 @@
  */
 
 // Debug configuration - set to 1 to enable verbose output
-#define DEBUG_PCS_STATE 0      // Enable PCS state/voltage debug output
+#define DEBUG_PCS_STATE 1      // Enable PCS state/voltage debug output
 #define DEBUG_CAN_TRAFFIC 0    // Enable CAN RX/TX message logging (CAN2 & CAN3)
 #define DEBUG_SDO_PARAMS 0     // Enable SDO parameter read/write logging
-#define DEBUG_PCS_CAN 0        // Enable PCS CAN RX message statistics (CAN1)
+#define DEBUG_PCS_CAN 1        // Enable PCS CAN RX message statistics (CAN1)
 #define DEBUG_PCS_TX 0         // Enable PCS CAN TX message logging (CAN1)
+#define DEBUG_PCS_RX 0         // Enable PCS CAN RX message logging (CAN1)
 #define DEBUG_CP_CAN 0         // Enable CP_CAN message logging (CAN2)
 
 #include <Arduino.h>
@@ -70,8 +71,10 @@ void buildParameterJson();
 // Pre-generated parameter JSON for web interface
 String parameterJson;
 
-// Direct data source callback for JSON transfer - returns byte at offset or -1 if out of range
-int getJsonByte(uint32_t offset) {
+// Data source callback for SDO data transfer
+// Used for JSON (0x5001)
+// Returns byte at offset or -1 if out of range
+int getDataByte(uint32_t offset) {
   if (offset >= parameterJson.length()) {
     return -1;  // End of data
   }
@@ -182,6 +185,14 @@ void setup() {
     }
   }
   Serial.println("CAN1 (Tesla PCS IPC) initialized at 500 kbps");
+
+  // Run loopback test to verify CAN hardware
+  Serial.println("Running CAN1 loopback test...");
+  if (ipcCan.runLoopbackTest(0x123, 100)) {
+    Serial.println("CAN1 loopback PASSED - hardware OK");
+  } else {
+    Serial.println("CAN1 loopback FAILED - check CAN hardware");
+  }
 
   // Initialize CAN2 for CP_CAN monitoring (500 kbps)
   Serial.println("Initializing CAN2 (PB5/PB13)...");
@@ -370,13 +381,6 @@ void updateParameters() {
   const VoltageData& voltage = PCSController::get_voltage_data();
   Param::SetFloat(Param::udc, voltage.hv_v);
   Param::SetFloat(Param::ulv, voltage.lv_v);
-  
-  // Debug: Print voltage once
-  #if DEBUG_PCS_STATE
-  if (millis() - lastDebug > 4900 && !debugPrinted) {
-    Serial.printf("PCS Voltages: HV=%.1fV LV=%.1fV\n", voltage.hv_v, voltage.lv_v);
-  }
-  #endif
 
   // Get DC current data
   const DCCurrentData& dcCurrent = PCSController::get_dc_current_data();
@@ -396,18 +400,39 @@ void updateParameters() {
 // OpenInverter FreeRTOS task
 void openinv_task(void *pvParameters) {
   // Register callbacks INSIDE the task to ensure proper thread initialization
-  canSdo->SetDataSource(getJsonByte);
+  canSdo->SetDataSource(getDataByte);
   canSdo->SetJsonRebuildCallback(buildParameterJson);
   
   // Build initial JSON
   buildParameterJson();
   
   Serial.println("OpenInverter task running");
+  
+  // Sync loaded parameters to PCS hardware (SetFixed doesn't trigger Change callbacks)
+  // Must be done here after command queue is created, not during init
+  Serial.println("Syncing parameters to PCS controller...");
+  
+  // Parameters that control PCS behavior via IPC CAN messages:
+  // - pacspnt (0x2B2) - charge power setpoint in watts
+  // - udcspnt (0x22A) - HV voltage setpoint in volts
+  // - udcdc (0x3A1) - DCDC voltage setpoint in volts
+  // - iaclim (0x23D) - AC current limit in amps
+  PCSController::set_charge_power_async(Param::GetInt(Param::pacspnt) * 1000);
+  PCSController::set_hv_voltage_async(Param::GetInt(Param::udcspnt));
+  PCSController::set_dcdc_voltage_async(Param::GetFloat(Param::udcdc));
+  PCSController::set_ac_current_limit_async(Param::GetInt(Param::iaclim));
+  
+  // Note: EVSE/cable limits (0x21D) are read from external sources, not set by params
+  // Note: idclim/udclim are for reference only, actual limits handled by PCS internally
+  // Note: pcstype affects message format but doesn't require immediate sync
 
   uint32_t lastSecond = 0;
 
   while(1) {
     uint32_t now = millis();
+
+    // Update error message timestamp
+    ErrorMessage::SetTime(now / 1000);  // Convert to seconds
 
     // Update uptime counter every second
     if (now - lastSecond >= 1000) {
@@ -503,6 +528,41 @@ void Param::Change(Param::PARAM_NUM paramNum) {
     case Param::iaclim:
       // Update AC current limit
       PCSController::set_ac_current_limit_async(Param::GetInt(Param::iaclim));
+      break;
+
+    case Param::idclim:
+      // DC current limit - stored for reference, actual limit controlled by PCS
+      // No direct setter needed as PCS handles this internally
+      break;
+
+    case Param::udclim:
+      // DC voltage limit - stored for reference, actual limit controlled by PCS
+      // No direct setter needed as PCS handles this internally
+      break;
+
+    case Param::pcstype:
+      // PCS Region (0=US, 1=EU) - affects 0x2B2 message format
+      // No immediate action needed - next Msg2B2() call will use new format
+      break;
+
+    case Param::modectl:
+      {
+        // State machine mode control: 0=Off, 1=Charge, 2=Drive
+        int mode = Param::GetInt(Param::modectl);
+        switch (mode) {
+          case 0:  // Off
+            PCSController::stop_async();
+            break;
+          case 1:  // Charge/Run
+            PCSController::start_charging_async();
+            break;
+          case 2:  // Drive
+            PCSController::start_drive_mode_async();
+            break;
+          default:
+            break;
+        }
+      }
       break;
 
     default:

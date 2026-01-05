@@ -10,7 +10,7 @@
 
 // Import debug flag from main.cpp
 #ifndef DEBUG_PCS_STATE
-#define DEBUG_PCS_STATE 0
+#define DEBUG_PCS_STATE 1
 #endif
 
 // Initialize static members
@@ -21,13 +21,19 @@ uint8_t PCSController::dcdc_enable_pin = 0;
 bool PCSController::pcs_pin_enabled = false;
 bool PCSController::charge_pin_enabled = false;
 bool PCSController::dcdc_pin_enabled = false;
+bool PCSController::can_enabled = false;
+bool PCSController::manual_override = false;
 
 PCSState PCSController::current_state = PCS_STATE_INIT;
 PCSState PCSController::target_state = PCS_STATE_OFF;
 uint8_t PCSController::precharge_timer = 0;
+uint8_t PCSController::pcs_wakeup_timer = 0;
 uint8_t PCSController::powerdown_timer = 0;
-uint32_t PCSController::last_update_ms = 0;
-uint32_t PCSController::last_100ms_update = 0;
+HardwareTimer *PCSController::message_timer = nullptr;
+volatile bool PCSController::flag_10ms = false;
+volatile bool PCSController::flag_50ms = false;
+volatile bool PCSController::flag_100ms = false;
+volatile uint16_t PCSController::timer_ticks = 0;
 QueueHandle_t PCSController::command_queue = nullptr;
 
 void PCSController::begin(CANBus *ipc_can_bus, uint8_t pcs_en_pin, uint8_t charge_en_pin, uint8_t dcdc_en_pin) {
@@ -46,6 +52,14 @@ void PCSController::begin(CANBus *ipc_can_bus, uint8_t pcs_en_pin, uint8_t charg
   // Initialize to safe state (all disabled)
   disable_all();
 
+  // Initialize hardware timer for message timing (1ms tick)
+  // Use TIM6 (basic timer)
+  message_timer = new HardwareTimer(TIM6);
+  message_timer->setOverflow(1000, HERTZ_FORMAT); // 1kHz = 1ms period
+  message_timer->attachInterrupt(timer_callback);
+  message_timer->resume();
+  DEBUG_SERIAL.println("PCS: Hardware timer started (1ms ticks)");
+
   DEBUG_SERIAL.println("PCS: Initializing CAN...");
   // Initialize low-level CAN communication
   PCSCan::begin(ipc_can_bus);
@@ -59,6 +73,13 @@ void PCSController::begin(CANBus *ipc_can_bus, uint8_t pcs_en_pin, uint8_t charg
   }
 
   current_state = PCS_STATE_OFF;
+
+  // IPC CAN messages are gated behind state machine progress (matches old firmware)
+  // CAN is enabled during PRECHARGE state after pcs_pin_enabled
+  // Note: OpenInverter SDO on CAN3 is separate and always available
+  can_enabled = false;
+  DEBUG_SERIAL.println("PCS: IPC CAN communication disabled (will enable during precharge)");
+
   DEBUG_SERIAL.println("PCS: Controller initialized with precharge state machine");
 }
 
@@ -82,27 +103,48 @@ bool PCSController::start_task() {
 }
 
 void PCSController::update() {
-  uint32_t now = millis();
-
   // Process any pending commands from the queue
   process_command_queue();
 
   // Process incoming CAN messages
   PCSCan::process_messages();
 
-  // Run state machine at 100ms intervals (10Hz)
-  if (now - last_100ms_update >= 100) {
+  // Send periodic CAN messages based on hardware timer flags
+  if (flag_10ms) {
+    flag_10ms = false;
+    send_10ms_messages();
+  }
+
+  if (flag_50ms) {
+    flag_50ms = false;
+    send_50ms_messages();
+  }
+
+  if (flag_100ms) {
+    flag_100ms = false;
+    send_100ms_messages();
     run_state_machine();
-    last_100ms_update = now;
   }
 
   // Update physical control pins
   update_control_pins();
+}
 
-  // Send periodic CAN messages (stagger them to reduce bus load)
-  if (now - last_update_ms >= 10) {
-    send_periodic_messages();
-    last_update_ms = now;
+void PCSController::timer_callback() {
+  // Called every 1ms by hardware timer
+  timer_ticks++;
+
+  // Set flags at appropriate intervals
+  if (timer_ticks % 10 == 0) {
+    flag_10ms = true;
+  }
+
+  if (timer_ticks % 50 == 0) {
+    flag_50ms = true;
+  }
+
+  if (timer_ticks % 100 == 0) {
+    flag_100ms = true;
   }
 }
 
@@ -152,41 +194,76 @@ void PCSController::process_command_queue() {
   }
 }
 
-void PCSController::send_periodic_messages() {
-  uint32_t now = millis();
+// Send critical heartbeat messages immediately when CAN is first enabled
+// This prevents MIA errors by satisfying PCS heartbeat requirements before timer ticks
+void PCSController::send_initial_messages() {
+  Serial.println("PCS: Sending initial heartbeat messages");
 
-  // Core messages needed for operation (10ms cycle)
+  // Match old firmware message ordering - single call per message type
+  // Mux variants alternate on subsequent calls
+  PCSCan::Msg13D();   // Required for PCS operation (post-2020 firmwares)
   PCSCan::Msg22A();   // Main control (mode and voltage)
-  PCSCan::Msg2B2(0);  // Power request (get from PCSCan later)
+  PCSCan::Msg3B2();   // BMS log - prevents bmsMia
+  PCSCan::Msg545();   // VCFront - prevents vcfrontMia
+  PCSCan::Msg333();   // UI watchdog - prevents uiMia
+}
+
+// Send messages at 10ms intervals (matches old firmware Ms10Task)
+void PCSController::send_10ms_messages() {
+  // IPC heartbeat messages must be sent whenever CAN is enabled
+  // These keep PCS responsive for communication even when not actively charging
+  if (!can_enabled) {
+    return;
+  }
+
+  // Order matches old firmware: Msg13D → Msg22A → Msg3B2
+  PCSCan::Msg13D();   // Required for PCS operation (post-2020 firmwares)
+  PCSCan::Msg22A();   // Main control (mode and voltage)
+  PCSCan::Msg3B2();   // BMS log (IPC heartbeat)
+}
+
+// Send messages at 50ms intervals (matches old firmware Ms50Task)
+void PCSController::send_50ms_messages() {
+  // IPC heartbeat messages (0x545) must be sent whenever CAN is enabled
+  // These keep PCS responsive for SDO reads even when not actively charging
+  if (!can_enabled) {
+    return;
+  }
+
+  PCSCan::Msg545();   // VCFront (IPC heartbeat)
+}
+
+// Send messages at 100ms intervals (matches old firmware Ms100Task)
+void PCSController::send_100ms_messages() {
+  // Send CAN messages whenever CAN is enabled (not just when PCS pin is enabled)
+  // This keeps PCS responsive and allows it to provide status information
+  if (!can_enabled) {
+    return;
+  }
+
+  PCSCan::Msg20A();   // Configuration
+  PCSCan::Msg212();   // Configuration
+  PCSCan::Msg21D();   // Configuration
+  PCSCan::Msg232();   // Configuration
+  PCSCan::Msg23D();   // AC current limit (alternate)
+  PCSCan::Msg25D();   // Configuration
+  
+  // Send actual charge power request (matches old firmware ChgPwrRamp())
+  uint16_t charge_power = PCSCan::get_control_params().charge_power_w;
+  PCSCan::Msg2B2(charge_power);
+  
+  PCSCan::Msg321();   // Configuration
   PCSCan::Msg333();   // UI watchdog
-
-  // Send other messages at reduced rate (100ms)
-  if ((now / 100) % 10 == 0) {
-    PCSCan::Msg3B2();   // BMS log
-    PCSCan::Msg545();   // VCFront
-    PCSCan::Msg3A1();   // DCDC setpoint
-  }
-
-  // Static configuration messages (send infrequently, every 5 seconds)
-  if ((now / 1000) % 5 == 0) {
-    PCSCan::Msg20A();
-    PCSCan::Msg212();
-    PCSCan::Msg21D();
-    PCSCan::Msg232();
-    PCSCan::Msg25D();
-    PCSCan::Msg321();
-  }
+  PCSCan::Msg3A1();   // DCDC setpoint
 }
 
 void PCSController::update_control_pins() {
-  // Update all control pins (HIGH = enabled)
+  // pcs_enable_pin is active HIGH (HIGH = enabled)
   digitalWrite(pcs_enable_pin, pcs_pin_enabled ? HIGH : LOW);
 
-  // Note: Charge and DCDC pins may need inverted logic (active LOW)
-  // Reference implementation uses Set() to enable, which could be active LOW
-  // Check your hardware and invert if needed
-  digitalWrite(charge_enable_pin, charge_pin_enabled ? HIGH : LOW);
-  digitalWrite(dcdc_enable_pin, dcdc_pin_enabled ? HIGH : LOW);
+  // charge_enable_pin and dcdc_enable_pin are active LOW (LOW = enabled)
+  digitalWrite(charge_enable_pin, charge_pin_enabled ? LOW : HIGH);
+  digitalWrite(dcdc_enable_pin, dcdc_pin_enabled ? LOW : HIGH);
 }
 
 // Direct Control Methods
@@ -217,7 +294,9 @@ void PCSController::set_cable_limit(uint8_t limit) {
 
 void PCSController::enable_pcs(bool enable) {
   pcs_pin_enabled = enable;
-  Serial.printf("PCS: Master enable %s\r\n", enable ? "ON" : "OFF");
+  manual_override = enable;  // Diagnostic mode - prevent state machine from overriding
+  Serial.printf("PCS: Master enable %s (manual_override=%s)\r\n",
+    enable ? "ON" : "OFF", manual_override ? "true" : "false");
 }
 
 // Async Control Methods (Queue-based)
@@ -294,10 +373,15 @@ void PCSController::disable_all() {
   pcs_pin_enabled = false;
   charge_pin_enabled = false;
   dcdc_pin_enabled = false;
+  can_enabled = false;  // Disable IPC CAN (matches old firmware DisableAll())
+  // Note: OpenInverter SDO on CAN3 remains available for parameter access
 
+  // Set all pins to disabled state
+  // pcs_enable_pin: active high, so LOW = disabled
+  // charge_enable_pin & dcdc_enable_pin: active low, so HIGH = disabled
   digitalWrite(pcs_enable_pin, LOW);
-  digitalWrite(charge_enable_pin, LOW);
-  digitalWrite(dcdc_enable_pin, LOW);
+  digitalWrite(charge_enable_pin, HIGH);
+  digitalWrite(dcdc_enable_pin, HIGH);
 
   PCSCan::set_mode(PCS_MODE_OFF);
   PCSCan::set_charge_enable(false);
@@ -389,10 +473,27 @@ void PCSController::run_state_machine() {
   }
   // Periodic state logging (every 5 seconds)
   else if (millis() - last_state_log > 5000) {
-    DEBUG_SERIAL.printf("PCS State: %d (status=%d, HV=%.1fV, AC=%.1fA)\r\n",
-                        current_state, pcs_charge_status,
-                        PCSCan::get_voltage_data().hv_v,
-                        PCSCan::get_ac_status().current_a);
+    const VoltageData& v = PCSCan::get_voltage_data();
+    const ACStatus& ac = PCSCan::get_ac_status();
+    const DCCurrentData& dc = PCSCan::get_dc_current_data();
+    const DCDCStatus& dcdc = PCSCan::get_dcdc_status();
+    const TemperatureData& temp = PCSCan::get_temperature_data();
+    const ChargerStatus& charger = PCSCan::get_charger_status();
+    
+    DEBUG_SERIAL.printf("PCS: state=%d status=%d mode=%d\r\n", 
+                        current_state, pcs_charge_status, PCSCan::get_mode());
+    DEBUG_SERIAL.printf("  HV: %.1fV  LV: %.1fV\r\n", 
+                        v.hv_v, v.lv_v);
+    DEBUG_SERIAL.printf("  AC: %.1fA %.1fV %.2fkW limit=%dA\r\n",
+                        ac.current_a, ac.voltage_v, ac.power_kw, ac.current_limit_a);
+    DEBUG_SERIAL.printf("  DC: %.1fA (A:%.1f B:%.1f C:%.1f)\r\n",
+                        dc.total_a, dc.phase_a_a, dc.phase_b_a, dc.phase_c_a);
+    DEBUG_SERIAL.printf("  DCDC: %.1fA %.1fW\r\n",
+                        dcdc.current_a, dcdc.power_w);
+    DEBUG_SERIAL.printf("  Temp: %dC (DCDC_B: %.1fC)\r\n",
+                        temp.local_c, temp.dcdc_b_c);
+    DEBUG_SERIAL.printf("  Charger: hw=%d avail=%.1fkW\r\n",
+                        charger.hw_type, charger.power_available_kw);
     last_state_log = millis();
   }
   #endif
@@ -407,6 +508,7 @@ void PCSController::run_state_machine() {
       // Safe state - everything disabled
       disable_all();
       precharge_timer = PRECHARGE_TIME_TICKS;  // Reset precharge timer
+      pcs_wakeup_timer = PCS_WAKEUP_TICKS;     // Reset PCS wakeup timer
       powerdown_timer = POWERDOWN_TIME_TICKS;  // Reset powerdown timer
       // Transition happens via start_charging() call
       break;
@@ -420,17 +522,36 @@ void PCSController::run_state_machine() {
       break;
 
     case PCS_STATE_PRECHARGE:
-      // Internal PCS initialization (CAN messaging, internal startup)
+      // Internal PCS initialization (matches old firmware ENABLE state)
       // Note: Actual HV precharge is controlled by BMS via contactors
 
-      // Decrement initialization timer (runs at 100ms rate)
+      // Step 1: Enable PCS hardware first
+      if (!pcs_pin_enabled) {
+        pcs_pin_enabled = true;
+        Serial.println("PCS: Enabling PCS hardware");
+      }
+
+      // Step 2: Short delay for PCS to power up before enabling CAN
+      // PCS needs brief time to be ready to ACK CAN messages
+      if (!can_enabled && pcs_wakeup_timer > 0) {
+        pcs_wakeup_timer--;
+        break;  // Wait for wakeup delay
+      }
+
+      // Step 3: Enable CAN and send initial heartbeats
+      if (!can_enabled) {
+        can_enabled = true;
+        Serial.println("PCS: Enabling IPC CAN after wakeup delay");
+        // Send critical heartbeat messages immediately to prevent MIA errors
+        send_initial_messages();
+      }
+
+      // Decrement precharge timer (runs at 100ms rate)
       if (precharge_timer > 0) {
         precharge_timer--;
 
         if (precharge_timer == 0) {
-          // Initialization complete - enable PCS
-          Serial.println("PCS: Internal initialization complete, enabling PCS");
-          pcs_pin_enabled = true;
+          Serial.println("PCS: Precharge complete, transitioning to activate");
           current_state = PCS_STATE_ACTIVATE;
         }
       }
@@ -467,10 +588,11 @@ void PCSController::run_state_machine() {
       break;
 
     case PCS_STATE_DRIVE:
-      // Drive mode - DCDC only, no charging
+      // Drive mode - DCDC only, no charging (matches old firmware DRIVE state)
       charge_pin_enabled = false;
       dcdc_pin_enabled = true;
       pcs_pin_enabled = true;
+      can_enabled = true;  // Ensure CAN is enabled in drive mode
 
       PCSCan::set_mode(PCS_MODE_DCDC_ONLY);
       PCSCan::set_charge_enable(false);

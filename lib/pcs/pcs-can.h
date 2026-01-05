@@ -19,6 +19,34 @@ enum PCSMode : uint8_t {
   PCS_MODE_CHARGE_DCDC = 0x0D    // Both charger and DCDC enabled
 };
 
+// PCS hardware types (from message 0x204 byte 7 bits 3-4)
+enum PCSHardwareType : uint8_t {
+  PCS_HW_11KW = 0,               // 48A single phase (11kW)
+  PCS_HW_7_7KW = 1,              // 32A single phase (7.7kW)
+  PCS_HW_3_8KW = 2               // 16A three phase (3.8kW)
+};
+
+// PCS charge status (from message 0x204 byte 0 bits 0-3)
+enum PCSChargeStatus : uint8_t {
+  PCS_STATUS_INIT = 0,           // Initializing
+  PCS_STATUS_IDLE = 1,           // Idle
+  PCS_STATUS_STARTUP = 2,        // Starting up
+  PCS_STATUS_WAIT_LINE = 3,      // Wait for line voltage
+  PCS_STATUS_QUALIFY = 4,        // Qualify line configuration
+  PCS_STATUS_ENABLE = 5,         // Enabled/charging
+  PCS_STATUS_SHUTDOWN = 7,       // Shutdown
+  PCS_STATUS_FAULTED = 8,        // Faulted
+  PCS_STATUS_CLEAR_FAULTS = 9    // Clearing faults
+};
+
+// Grid configuration (from message 0x204 byte 0 bits 6-7)
+enum PCSGridConfig : uint8_t {
+  PCS_GRID_NONE = 0,             // No grid detected
+  PCS_GRID_SINGLE_PHASE = 1,     // Single phase
+  PCS_GRID_THREE_PHASE = 2,      // Three phase
+  PCS_GRID_THREE_PHASE_DELTA = 3 // Three phase delta
+};
+
 // Control parameters set by higher-level controller
 struct ControlParams {
   uint16_t hv_voltage_v;          // HV bus voltage setpoint (V)
@@ -31,9 +59,9 @@ struct ControlParams {
 
 // Charger status data (from message 0x204)
 struct ChargerStatus {
-  uint8_t hw_type;                // Hardware type (0=11kW, 1=7.7kW, 2=3.8kW)
-  uint8_t status;                 // Charge status
-  uint8_t grid_config;            // Grid configuration
+  PCSHardwareType hw_type;        // Hardware type
+  PCSChargeStatus status;         // Charge status
+  PCSGridConfig grid_config;      // Grid configuration
   float power_available_kw;       // Available charge power (kW)
 };
 
@@ -74,13 +102,6 @@ struct DCCurrentData {
   float phase_b_a;                // Phase B DC output current (A)
   float phase_c_a;                // Phase C DC output current (A)
   float total_a;                  // Total DC output current (A)
-};
-
-// Alert tracking (from messages 0x424 and 0x504)
-struct AlertData {
-  uint8_t boot_id;                // Boot/firmware ID
-  uint8_t count;                  // Alert counter
-  uint8_t matrix[10];             // Alert history
 };
 
 // Message multiplexing state
@@ -142,13 +163,13 @@ public:
   static void set_charge_enable(bool enable) { charge_enable = enable; }
 
   // Struct-level status accessors (return references for efficient access)
+  static const ControlParams& get_control_params() { return control_params; }
   static const ChargerStatus& get_charger_status() { return charger_status; }
   static const DCDCStatus& get_dcdc_status() { return dcdc_status; }
   static const ACStatus& get_ac_status() { return ac_status; }
   static const TemperatureData& get_temperature_data() { return temperature_data; }
   static const VoltageData& get_voltage_data() { return voltage_data; }
   static const DCCurrentData& get_dc_current_data() { return dc_current_data; }
-  static const AlertData& get_alert_data() { return alert_data; }
   static PCSMode get_mode() { return current_mode; }
 
 private:
@@ -167,7 +188,6 @@ private:
   static TemperatureData temperature_data;
   static VoltageData voltage_data;
   static DCCurrentData dc_current_data;
-  static AlertData alert_data;
   static MuxState mux_state;
 
   // Helper functions

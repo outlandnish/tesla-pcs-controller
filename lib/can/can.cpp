@@ -17,7 +17,8 @@ CANBus* CANBus::instance3 = nullptr;
 CANBus::CANBus(uint32_t rx_pin, uint32_t tx_pin, int8_t term_pin)
   : CAN_COMMON(14),  // STM32 CAN has 14 filter banks
     rx_pin(rx_pin), tx_pin(tx_pin), term_pin(term_pin),
-    can_instance(nullptr), hcan(nullptr) {
+    can_instance(nullptr), hcan(nullptr),
+    tx_queue_head(0), tx_queue_tail(0) {
 }
 
 bool CANBus::initGPIO() {
@@ -79,16 +80,24 @@ bool CANBus::initGPIO() {
 }
 
 bool CANBus::begin(uint32_t baudrate) {
+  DEBUG_SERIAL.println("  CANBus::begin() starting...");
+
   // Initialize GPIO pins first
   if (!initGPIO()) {
+    DEBUG_SERIAL.println("  ERROR: initGPIO() failed");
     return false;
   }
+  DEBUG_SERIAL.printf("  GPIO init OK, CAN instance: %s\n",
+    can_instance == CAN1 ? "CAN1" :
+    can_instance == CAN2 ? "CAN2" :
+    can_instance == CAN3 ? "CAN3" : "UNKNOWN");
 
   // Configure CAN peripheral
   hcan->Instance = can_instance;
 
   // Configure CAN parameters - dynamically detect APB1 clock
   uint32_t apb1_clock = HAL_RCC_GetPCLK1Freq();
+  DEBUG_SERIAL.printf("  APB1 clock: %lu Hz\n", apb1_clock);
   uint32_t prescaler;
   uint32_t bs1, bs2;
   uint32_t tq;
@@ -128,6 +137,8 @@ bool CANBus::begin(uint32_t baudrate) {
 
   // Calculate actual baudrate achieved
   uint32_t actual_baudrate = apb1_clock / (prescaler * tq);
+  DEBUG_SERIAL.printf("  Timing: prescaler=%lu, TQ=%lu, actual=%lu bps\n",
+    prescaler, tq, actual_baudrate);
 
   hcan->Init.Prescaler = prescaler;
   hcan->Init.Mode = CAN_MODE_NORMAL;
@@ -141,7 +152,10 @@ bool CANBus::begin(uint32_t baudrate) {
   hcan->Init.ReceiveFifoLocked = DISABLE;
   hcan->Init.TransmitFifoPriority = DISABLE;
 
-  if (HAL_CAN_Init(hcan) != HAL_OK) {
+  HAL_StatusTypeDef initStatus = HAL_CAN_Init(hcan);
+  DEBUG_SERIAL.printf("  HAL_CAN_Init: %s (error=0x%08lX)\n",
+    initStatus == HAL_OK ? "OK" : "FAILED", HAL_CAN_GetError(hcan));
+  if (initStatus != HAL_OK) {
     return false;
   }
 
@@ -165,14 +179,31 @@ bool CANBus::begin(uint32_t baudrate) {
     filter.SlaveStartFilterBank = 14;  // CAN2 uses filter banks 14-27
   }
 
-  if (HAL_CAN_ConfigFilter(hcan, &filter) != HAL_OK) {
+  HAL_StatusTypeDef filterStatus = HAL_CAN_ConfigFilter(hcan, &filter);
+  DEBUG_SERIAL.printf("  HAL_CAN_ConfigFilter: %s\n", filterStatus == HAL_OK ? "OK" : "FAILED");
+  if (filterStatus != HAL_OK) {
     return false;
   }
 
-  if (HAL_CAN_Start(hcan) != HAL_OK) {
+  HAL_StatusTypeDef startStatus = HAL_CAN_Start(hcan);
+  DEBUG_SERIAL.printf("  HAL_CAN_Start: %s (state=0x%02X, error=0x%08lX)\n",
+    startStatus == HAL_OK ? "OK" : "FAILED",
+    HAL_CAN_GetState(hcan), HAL_CAN_GetError(hcan));
+  if (startStatus != HAL_OK) {
     return false;
   }
 
+  // Abort any pending transmissions from previous session
+  HAL_CAN_AbortTxRequest(hcan, CAN_TX_MAILBOX0 | CAN_TX_MAILBOX1 | CAN_TX_MAILBOX2);
+  
+  // Wait for mailboxes to clear
+  delay(10);
+  
+  // Verify mailboxes are free
+  uint32_t free_level = HAL_CAN_GetTxMailboxesFreeLevel(hcan);
+  DEBUG_SERIAL.printf("  TX mailboxes free: %lu/3\n", free_level);
+
+  DEBUG_SERIAL.println("  CAN bus started successfully");
   return true;
 }
 
@@ -189,6 +220,52 @@ void CANBus::end() {
   }
 }
 
+// Queue management functions
+bool CANBus::enqueueTxMessage(const CANTxMessage& msg) {
+  uint8_t next_head = (tx_queue_head + 1) % CAN_TX_QUEUE_SIZE;
+  if (next_head == tx_queue_tail) {
+    // Queue is full
+    return false;
+  }
+  tx_queue[tx_queue_head] = msg;
+  tx_queue_head = next_head;
+  return true;
+}
+
+bool CANBus::dequeueTxMessage(CANTxMessage& msg) {
+  if (tx_queue_head == tx_queue_tail) {
+    // Queue is empty
+    return false;
+  }
+  msg = tx_queue[tx_queue_tail];
+  tx_queue_tail = (tx_queue_tail + 1) % CAN_TX_QUEUE_SIZE;
+  return true;
+}
+
+void CANBus::processTxQueue() {
+  // Try to send queued messages when mailboxes become available
+  while (HAL_CAN_GetTxMailboxesFreeLevel(hcan) > 0 && tx_queue_head != tx_queue_tail) {
+    CANTxMessage msg;
+    if (!dequeueTxMessage(msg)) break;
+    
+    CAN_TxHeaderTypeDef txHeader;
+    uint32_t txMailbox;
+    
+    txHeader.StdId = msg.id;
+    txHeader.ExtId = msg.id;
+    txHeader.IDE = msg.extended ? CAN_ID_EXT : CAN_ID_STD;
+    txHeader.RTR = msg.rtr ? CAN_RTR_REMOTE : CAN_RTR_DATA;
+    txHeader.DLC = msg.len;
+    txHeader.TransmitGlobalTime = DISABLE;
+    
+    if (HAL_CAN_AddTxMessage(hcan, &txHeader, msg.data, &txMailbox) != HAL_OK) {
+      // Failed to send - put it back at the front of the queue
+      tx_queue_tail = (tx_queue_tail - 1 + CAN_TX_QUEUE_SIZE) % CAN_TX_QUEUE_SIZE;
+      break;
+    }
+  }
+}
+
 bool CANBus::sendMessage(uint32_t id, uint8_t* data, uint8_t len) {
   if (!hcan) return false;
 
@@ -201,6 +278,18 @@ bool CANBus::sendMessage(uint32_t id, uint8_t* data, uint8_t len) {
   txHeader.RTR = CAN_RTR_DATA;
   txHeader.DLC = len;
   txHeader.TransmitGlobalTime = DISABLE;
+
+  // Wait for a free mailbox with timeout
+  uint32_t timeout = 0;
+  while (HAL_CAN_GetTxMailboxesFreeLevel(hcan) == 0 && timeout < 100) {
+    timeout++;
+    delayMicroseconds(10);
+  }
+  
+  if (timeout >= 100) {
+    // Timeout after 1ms - mailboxes still full
+    return false;
+  }
 
   return (HAL_CAN_AddTxMessage(hcan, &txHeader, data, &txMailbox) == HAL_OK);
 }
@@ -218,6 +307,18 @@ bool CANBus::sendFrame(CAN_FRAME& txFrame) {
   txHeader.RTR = txFrame.rtr ? CAN_RTR_REMOTE : CAN_RTR_DATA;
   txHeader.DLC = txFrame.length;
   txHeader.TransmitGlobalTime = DISABLE;
+
+  // Wait for a free mailbox with timeout
+  uint32_t timeout = 0;
+  while (HAL_CAN_GetTxMailboxesFreeLevel(hcan) == 0 && timeout < 100) {
+    timeout++;
+    delayMicroseconds(10);
+  }
+  
+  if (timeout >= 100) {
+    // Timeout after 1ms - mailboxes still full
+    return false;
+  }
 
   return (HAL_CAN_AddTxMessage(hcan, &txHeader, txFrame.data.uint8, &txMailbox) == HAL_OK);
 }
@@ -611,6 +712,67 @@ uint32_t CANBus::getErrorCode() {
   return HAL_CAN_GetError(hcan);
 }
 
+bool CANBus::abortPendingTx() {
+  if (!hcan) return false;
+
+  // Abort all pending TX requests
+  HAL_StatusTypeDef status = HAL_CAN_AbortTxRequest(hcan,
+    CAN_TX_MAILBOX0 | CAN_TX_MAILBOX1 | CAN_TX_MAILBOX2);
+
+  if (status == HAL_OK) {
+    DEBUG_SERIAL.println("  TX mailboxes cleared");
+    return true;
+  }
+  return false;
+}
+
+bool CANBus::resetBus() {
+  if (!hcan) return false;
+
+  DEBUG_SERIAL.println("  Resetting CAN bus...");
+
+  // Stop CAN
+  HAL_CAN_Stop(hcan);
+
+  // Reset error state
+  hcan->Instance->MCR |= CAN_MCR_RESET;
+  uint32_t timeout = 1000;
+  while ((hcan->Instance->MCR & CAN_MCR_RESET) && timeout--) {
+    delayMicroseconds(10);
+  }
+
+  // Reinitialize
+  if (HAL_CAN_Init(hcan) != HAL_OK) {
+    DEBUG_SERIAL.println("  CAN reinit failed!");
+    return false;
+  }
+
+  // Reconfigure filter to accept all
+  CAN_FilterTypeDef filter = {0};
+  filter.FilterBank = getFilterBank();
+  filter.FilterMode = CAN_FILTERMODE_IDMASK;
+  filter.FilterScale = CAN_FILTERSCALE_32BIT;
+  filter.FilterIdHigh = 0x0000;
+  filter.FilterIdLow = 0x0000;
+  filter.FilterMaskIdHigh = 0x0000;
+  filter.FilterMaskIdLow = 0x0000;
+  filter.FilterFIFOAssignment = CAN_RX_FIFO0;
+  filter.FilterActivation = ENABLE;
+  if (can_instance == CAN1) {
+    filter.SlaveStartFilterBank = 14;
+  }
+  HAL_CAN_ConfigFilter(hcan, &filter);
+
+  // Restart
+  if (HAL_CAN_Start(hcan) != HAL_OK) {
+    DEBUG_SERIAL.println("  CAN restart failed!");
+    return false;
+  }
+
+  DEBUG_SERIAL.println("  CAN bus reset complete");
+  return true;
+}
+
 void CANBus::printStatus() {
   if (!hcan) {
     DEBUG_SERIAL.println("  CAN not initialized");
@@ -650,12 +812,28 @@ void CANBus::printStatus() {
     if (error & HAL_CAN_ERROR_BR)   DEBUG_SERIAL.println("    - Bit Recessive Error");
     if (error & HAL_CAN_ERROR_BD)   DEBUG_SERIAL.println("    - Bit Dominant Error");
     if (error & HAL_CAN_ERROR_CRC)  DEBUG_SERIAL.println("    - CRC Error");
+    if (error & 0x00100000)  DEBUG_SERIAL.println("    - Not Initialized");
+    if (error & 0x00200000)  DEBUG_SERIAL.println("    - Not Started");
+    if (error & 0x00400000)  DEBUG_SERIAL.println("    - Parameter Error");
   }
 
   DEBUG_SERIAL.printf("  TX Error Count: %d\r\n", tec);
   DEBUG_SERIAL.printf("  RX Error Count: %d\r\n", rec);
   DEBUG_SERIAL.printf("  RX FIFO0 Level: %lu\r\n", HAL_CAN_GetRxFifoFillLevel(hcan, CAN_RX_FIFO0));
   DEBUG_SERIAL.printf("  TX Mailboxes Free: %lu\r\n", HAL_CAN_GetTxMailboxesFreeLevel(hcan));
+}
+
+void CANBus::getErrorCounters(uint8_t &txErrors, uint8_t &rxErrors) {
+  if (!hcan) {
+    txErrors = 0;
+    rxErrors = 0;
+    return;
+  }
+
+  // Read error counters from ESR register
+  uint32_t esr = hcan->Instance->ESR;
+  txErrors = (esr >> 16) & 0xFF;  // TX error counter
+  rxErrors = (esr >> 24) & 0xFF;  // RX error counter
 }
 
 uint8_t CANBus::getFilterBank() {

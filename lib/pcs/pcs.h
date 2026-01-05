@@ -53,6 +53,7 @@
 
 #include <Arduino.h>
 #include <STM32FreeRTOS.h>
+#include <HardwareTimer.h>
 #include "../can/can.h"
 #include "pcs-can.h"
 
@@ -162,7 +163,6 @@ public:
   static const TemperatureData& get_temperature_data() { return PCSCan::get_temperature_data(); }
   static const VoltageData& get_voltage_data() { return PCSCan::get_voltage_data(); }
   static const DCCurrentData& get_dc_current_data() { return PCSCan::get_dc_current_data(); }
-  static const AlertData& get_alert_data() { return PCSCan::get_alert_data(); }
 
 private:
   // Control pins
@@ -174,6 +174,8 @@ private:
   static bool pcs_pin_enabled;
   static bool charge_pin_enabled;
   static bool dcdc_pin_enabled;
+  static bool can_enabled;  // IPC CAN communication enabled (independent of actual activation)
+  static bool manual_override;  // Diagnostic mode - prevents state machine from overriding enables
 
   // State tracking
   static PCSState current_state;
@@ -183,13 +185,26 @@ private:
   static uint8_t precharge_timer;
   static const uint8_t PRECHARGE_TIME_TICKS = 30;
 
+  // PCS wakeup timing - delay between enabling PCS hardware and starting CAN
+  // PCS needs time to power up before it can ACK CAN messages
+  // Keep this short - PCS starts MIA timers immediately on power up
+  // (in 100ms ticks, default 2 = 200ms)
+  static uint8_t pcs_wakeup_timer;
+  static const uint8_t PCS_WAKEUP_TICKS = 2;
+
   // Power down timing (in 100ms ticks, default 10 = 1 second)
   static uint8_t powerdown_timer;
   static const uint8_t POWERDOWN_TIME_TICKS = 10;
 
-  // Message timing
-  static uint32_t last_update_ms;
-  static uint32_t last_100ms_update;
+  // Hardware timer for message timing
+  static HardwareTimer *message_timer;
+  static volatile bool flag_10ms;
+  static volatile bool flag_50ms;
+  static volatile bool flag_100ms;
+  static volatile uint16_t timer_ticks;
+
+  // Timer interrupt callback
+  static void timer_callback();
 
   // Command queue for FreeRTOS tasks
   static QueueHandle_t command_queue;
@@ -200,7 +215,10 @@ private:
 
   // Internal helper functions
   static void process_command_queue();
-  static void send_periodic_messages();
+  static void send_initial_messages();  // Burst of all messages when CAN first enabled
+  static void send_10ms_messages();
+  static void send_50ms_messages();
+  static void send_100ms_messages();
   static void update_control_pins();
   static void run_state_machine();
   static void disable_all();

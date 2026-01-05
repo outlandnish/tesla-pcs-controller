@@ -6,6 +6,20 @@
 #include "Arduino.h"
 #include "can_common.h"
 
+// TX queue size - configurable
+#ifndef CAN_TX_QUEUE_SIZE
+#define CAN_TX_QUEUE_SIZE 16
+#endif
+
+// Structure for queued TX messages
+struct CANTxMessage {
+  uint32_t id;
+  uint8_t data[8];
+  uint8_t len;
+  bool extended;
+  bool rtr;
+};
+
 // Callback function type for RX interrupts (legacy)
 typedef void (*CANRxCallback)(uint32_t id, uint8_t* data, uint8_t len);
 
@@ -56,6 +70,9 @@ class CANBus : public CAN_COMMON {
     // Debug/diagnostics
     void printStatus();
     uint32_t getErrorCode();
+    bool abortPendingTx();
+    bool resetBus();
+    void getErrorCounters(uint8_t &txErrors, uint8_t &rxErrors);
 
     // Interrupt configuration (legacy)
     bool enableRxInterrupt(CANRxCallback callback);
@@ -75,6 +92,15 @@ class CANBus : public CAN_COMMON {
     int8_t term_pin;
     CAN_TypeDef* can_instance;
     CAN_HandleTypeDef* hcan;
+
+    // TX queue for buffering when mailboxes are full
+    CANTxMessage tx_queue[CAN_TX_QUEUE_SIZE];
+    volatile uint8_t tx_queue_head;
+    volatile uint8_t tx_queue_tail;
+
+    bool enqueueTxMessage(const CANTxMessage& msg);
+    bool dequeueTxMessage(CANTxMessage& msg);
+    void processTxQueue();
 
     CAN_HandleTypeDef* getCAN();
     uint8_t getFilterBank();

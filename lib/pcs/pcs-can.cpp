@@ -7,16 +7,23 @@
  */
 
 #include "pcs-can.h"
+#include "pcs.h"  // For PCSController::is_pcs_enabled()
 #include "param_prj.h"  // For parameter default values
+#include "params.h"  // For Param::GetInt()
 #include "debug_serial.h"  // Use common debug serial
+#include "errormessage.h"  // For error posting
 
 // Import debug flag from main.cpp
 #ifndef DEBUG_PCS_CAN
-#define DEBUG_PCS_CAN 0
+#define DEBUG_PCS_CAN 1
 #endif
 
 #ifndef DEBUG_PCS_TX
 #define DEBUG_PCS_TX 0
+#endif
+
+#ifndef DEBUG_PCS_RX
+#define DEBUG_PCS_RX 0
 #endif
 
 // Initialize static members
@@ -38,9 +45,9 @@ ControlParams PCSCan::control_params = {
 };
 
 ChargerStatus PCSCan::charger_status = {
-  .hw_type = 0,
-  .status = 0,
-  .grid_config = 0,
+  .hw_type = PCS_HW_11KW,
+  .status = PCS_STATUS_INIT,
+  .grid_config = PCS_GRID_NONE,
   .power_available_kw = 0.0f
 };
 
@@ -78,12 +85,6 @@ DCCurrentData PCSCan::dc_current_data = {
   .total_a = 0.0f
 };
 
-AlertData PCSCan::alert_data = {
-  .boot_id = 0,
-  .count = 0,
-  .matrix = {0}
-};
-
 // Mux state is populated from PCS CAN messages
 MuxState PCSCan::mux_state = {
   .mux_3b2 = false,
@@ -93,6 +94,24 @@ MuxState PCSCan::mux_state = {
   .backup_2c4 = false,
   .got_dci = false
 };
+
+// Helper function to log RX messages
+static void log_rx_message(uint32_t id, const uint32_t data[2]) {
+  #if DEBUG_PCS_RX
+  const uint8_t* bytes = (const uint8_t*)data;
+  DEBUG_SERIAL.print("IPC RX: 0x");
+  if (id < 0x100) DEBUG_SERIAL.print("0");
+  if (id < 0x10) DEBUG_SERIAL.print("0");
+  DEBUG_SERIAL.print(id, HEX);
+  DEBUG_SERIAL.print(" [8] ");
+  for (uint8_t i = 0; i < 8; i++) {
+    if (bytes[i] < 0x10) DEBUG_SERIAL.print("0");
+    DEBUG_SERIAL.print(bytes[i], HEX);
+    DEBUG_SERIAL.print(" ");
+  }
+  DEBUG_SERIAL.println();
+  #endif
+}
 
 void PCSCan::begin(CANBus *ipc_can_bus) {
   can_bus = ipc_can_bus;
@@ -104,26 +123,44 @@ void PCSCan::process_messages() {
 
   static uint32_t lastDebugTime = 0;
   static uint32_t messageCount = 0;
+  
   uint32_t can_id;
   uint8_t data[8];
   uint8_t len;
 
   while (can_bus->receiveMessage(can_id, data, len)) {
     messageCount++;
+    
     uint32_t data_words[2];
     memcpy(data_words, data, 8);
     process_frame(can_id, data_words);
   }
   
-  // Debug: Print message count every 5 seconds
-  // WARNING: Serial is not thread-safe - only enable for debugging
+  // Debug: Print message count and error stats every 5 seconds
   #if DEBUG_PCS_CAN
   if (millis() - lastDebugTime > 5000) {
+    DEBUG_SERIAL.printf("CAN1 (IPC): PCS_Enable=%s\n", PCSController::is_pcs_enabled() ? "true" : "false");
+    
+    // Get error counters
+    uint8_t txErrors, rxErrors;
+    can_bus->getErrorCounters(txErrors, rxErrors);
+    
     if (messageCount > 0) {
-      DEBUG_SERIAL.printf("CAN1 (IPC): Received %lu messages in last 5 sec\n", messageCount);
+      DEBUG_SERIAL.printf("CAN1 (IPC): Received %lu messages in last 5 sec (TX_ERR=%d, RX_ERR=%d)\n", 
+        messageCount, txErrors, rxErrors);
     } else {
-      DEBUG_SERIAL.println("CAN1 (IPC): No messages received - PCS may be offline");
+      DEBUG_SERIAL.printf("CAN1 (IPC): No messages received (TX_ERR=%d, RX_ERR=%d)\n", txErrors, rxErrors);
+      
+      // Show detailed status if errors detected or no messages
+      if (txErrors > 0 || rxErrors > 0) {
+        DEBUG_SERIAL.println("CAN1 (IPC) Status:");
+        can_bus->printStatus();
+      } else {
+        DEBUG_SERIAL.println("  PCS may be offline or not transmitting");
+      }
     }
+    
+    // Reset counters
     messageCount = 0;
     lastDebugTime = millis();
   }
@@ -131,6 +168,8 @@ void PCSCan::process_messages() {
 }
 
 void PCSCan::process_frame(uint32_t can_id, uint32_t data[2]) {
+  log_rx_message(can_id, data);
+
   switch (can_id) {
     case 0x204: handle204(data); break;
     case 0x224: handle224(data); break;
@@ -149,10 +188,10 @@ void PCSCan::process_frame(uint32_t can_id, uint32_t data[2]) {
 
 void PCSCan::handle204(uint32_t data[2]) {
   uint8_t* bytes = (uint8_t*)data;
-  charger_status.hw_type = (bytes[7] >> 3) & 0x03;
-  charger_status.status = (bytes[0]) & 0x0f;
+  charger_status.hw_type = (PCSHardwareType)((bytes[7] >> 3) & 0x03);
+  charger_status.status = (PCSChargeStatus)((bytes[0]) & 0x0f);
   charger_status.power_available_kw = bytes[3] * 0.1f;
-  charger_status.grid_config = (bytes[0] >> 6) & 0x3;
+  charger_status.grid_config = (PCSGridConfig)((bytes[0] >> 6) & 0x3);
 }
 
 void PCSCan::handle224(uint32_t data[2]) {
@@ -220,15 +259,50 @@ void PCSCan::handle424(uint32_t data[2]) {
   uint8_t* bytes = (uint8_t*)data;
   uint8_t alert_id = bytes[0];
 
-  // Store in alert matrix
-  alert_data.matrix[alert_data.count] = alert_id;
-  alert_data.count++;
-  if (alert_data.count >= 10) alert_data.count = 0;
+  #if DEBUG_PCS_CAN
+  DEBUG_SERIAL.printf("PCS Alert 0x%02X received\r\n", alert_id);
+  #endif
+
+  // Special handling for CAN rationality alert (0x1E = alert 30)
+  // Extract which CAN message caused the error and what the error was
+  if (alert_id == 0x1E) {
+    uint8_t error_detail = bytes[2] & 0x07;
+    uint16_t error_can_id = (bytes[4] << 8) | bytes[3];
+    DEBUG_SERIAL.printf("  CAN Rationality: ID=0x%03X err=%d", error_can_id, error_detail);
+    if (error_detail == 0x01) DEBUG_SERIAL.println(" (msg too long)");
+    else if (error_detail == 0x02) DEBUG_SERIAL.println(" (msg too short)");
+    else if (error_detail == 0x03) DEBUG_SERIAL.println(" (msg missing)");
+    else DEBUG_SERIAL.println();
+
+    // Adaptive message format handling (matches old firmware ProcessCANRat)
+    if (error_can_id == 0x2B2) {
+      if (error_detail == 0x01) {
+        // Message too long - switch to short (3-byte) format
+        DEBUG_SERIAL.println("  Switching 0x2B2 to short format");
+        Param::SetInt(Param::pcstype, 0);
+      } else if (error_detail == 0x02) {
+        // Message too short - switch to long (5-byte) format
+        DEBUG_SERIAL.println("  Switching 0x2B2 to long format");
+        Param::SetInt(Param::pcstype, 1);
+      }
+    }
+  }
+
+  // Map PCS alert ID to error message and post it
+  // PCS alerts are numbered 0x01-0x6C (1-108)
+  ERROR_MESSAGE_NUM error = ERROR_NONE;
+  if (alert_id >= 0x01 && alert_id <= 0x6C) {
+    error = (ERROR_MESSAGE_NUM)(ERR_PCS_a001_chgHwInputOc + (alert_id - 0x01));
+    ErrorMessage::Post(error);
+  }
+  else {
+    DEBUG_SERIAL.printf("  Unknown PCS alert ID: 0x%02X\r\n", alert_id);
+  }
 }
 
 void PCSCan::handle504(uint32_t data[2]) {
   uint8_t* bytes = (uint8_t*)data;
-  alert_data.boot_id = bytes[7];
+  // Boot ID counter in bytes[7] - not currently used
 }
 
 void PCSCan::handle76C(uint32_t data[2]) {
@@ -274,14 +348,17 @@ void PCSCan::Msg13D() {
   if (can_bus == nullptr) return;
 
   uint8_t bytes[6];
-  if (!charge_enable) bytes[0] = 0x05;
-  if (charge_enable) bytes[0] = 0x0A;
+  // 0x05 = charger enabled, 0x0A = charger disabled (per old firmware comments)
+  if (charge_enable) bytes[0] = 0x05;
+  if (!charge_enable) bytes[0] = 0x0A;
   bytes[1] = control_params.ac_current_limit_a * 2;
   bytes[2] = 0xAA;
   bytes[3] = 0x1A;
   bytes[4] = 0xFF;
   bytes[5] = 0x02;
-  can_bus->sendMessage(0x13D, bytes, 6);
+  if (!can_bus->sendMessage(0x13D, bytes, 6)) {
+    DEBUG_SERIAL.println("ERROR: Failed to send 0x13D");
+  }
 }
 
 void PCSCan::Msg20A() {
@@ -294,7 +371,9 @@ void PCSCan::Msg20A() {
   bytes[3] = 0x82;
   bytes[4] = 0x18;
   bytes[5] = 0x01;
-  can_bus->sendMessage(0x20A, bytes, 6);
+  if (!can_bus->sendMessage(0x20A, bytes, 6)) {
+    DEBUG_SERIAL.println("ERROR: Failed to send 0x20A");
+  }
 }
 
 void PCSCan::Msg212() {
@@ -309,7 +388,10 @@ void PCSCan::Msg212() {
   bytes[5] = 0x15;
   bytes[6] = 0x06;
   bytes[7] = 0x63;
-  can_bus->sendMessage(0x212, bytes, 8);
+  log_tx_message(0x212, bytes, 8);
+  if (!can_bus->sendMessage(0x212, bytes, 8)) {
+    DEBUG_SERIAL.println("ERROR: Failed to send 0x212");
+  }
 }
 
 void PCSCan::Msg21D() {
@@ -324,7 +406,9 @@ void PCSCan::Msg21D() {
   bytes[5] = 0x00;
   bytes[6] = 0x60;
   bytes[7] = 0x10;
-  can_bus->sendMessage(0x21D, bytes, 8);
+  if (!can_bus->sendMessage(0x21D, bytes, 8)) {
+    DEBUG_SERIAL.println("ERROR: Failed to send 0x21D");
+  }
 }
 
 void PCSCan::Msg22A() {
@@ -336,7 +420,9 @@ void PCSCan::Msg22A() {
   bytes[2] = (control_params.hv_voltage_v & 0xF) << 4 | current_mode;
   bytes[3] = (control_params.hv_voltage_v >> 4) & 0xFF;
   log_tx_message(0x22A, bytes, 4);
-  can_bus->sendMessage(0x22A, bytes, 4);
+  if (!can_bus->sendMessage(0x22A, bytes, 4)) {
+    DEBUG_SERIAL.println("ERROR: Failed to send 0x22A");
+  }
 }
 
 void PCSCan::Msg232() {
@@ -351,19 +437,24 @@ void PCSCan::Msg232() {
   bytes[5] = 0x04;
   bytes[6] = 0x00;
   bytes[7] = 0x00;
-  can_bus->sendMessage(0x232, bytes, 8);
+  if (!can_bus->sendMessage(0x232, bytes, 8)) {
+    DEBUG_SERIAL.println("ERROR: Failed to send 0x232");
+  }
 }
 
 void PCSCan::Msg23D() {
   if (can_bus == nullptr) return;
 
   uint8_t bytes[4];
-  if (!charge_enable) bytes[0] = 0x05;
-  if (charge_enable) bytes[0] = 0x0A;
+  // 0x05 = charger enabled, 0x0A = charger disabled (per old firmware comments)
+  if (charge_enable) bytes[0] = 0x05;
+  if (!charge_enable) bytes[0] = 0x0A;
   bytes[1] = control_params.ac_current_limit_a * 2;
   bytes[2] = 0xFF;
   bytes[3] = 0x0F;
-  can_bus->sendMessage(0x23D, bytes, 4);
+  if (!can_bus->sendMessage(0x23D, bytes, 4)) {
+    DEBUG_SERIAL.println("ERROR: Failed to send 0x23D");
+  }
 }
 
 void PCSCan::Msg25D() {
@@ -378,20 +469,41 @@ void PCSCan::Msg25D() {
   bytes[5] = 0xC1;
   bytes[6] = 0x0A;
   bytes[7] = 0xE0;
-  can_bus->sendMessage(0x25D, bytes, 8);
+  log_tx_message(0x25D, bytes, 8);
+  if (!can_bus->sendMessage(0x25D, bytes, 8)) {
+    DEBUG_SERIAL.println("ERROR: Failed to send 0x25D");
+  }
 }
 
 void PCSCan::Msg2B2(uint16_t charge_power_w) {
   if (can_bus == nullptr) return;
 
-  // Use 3-byte variant (US version)
-  uint8_t bytes[3];
-  bytes[0] = charge_power_w & 0xFF;
-  bytes[1] = charge_power_w >> 8;
-  if (charge_enable) bytes[2] = 0x00;
-  if (!charge_enable) bytes[2] = 0x02;
-  log_tx_message(0x2B2, bytes, 3);
-  can_bus->sendMessage(0x2B2, bytes, 3);
+  // Check pcstype parameter: 0=US (3-byte), 1=EU (5-byte)
+  bool use_long_format = (Param::GetInt(Param::pcstype) == 1);
+
+  if (use_long_format) {
+    // 5-byte variant (EU version - newer firmware)
+    uint8_t bytes[5];
+    bytes[0] = charge_power_w & 0xFF;
+    bytes[1] = charge_power_w >> 8;
+    bytes[2] = charge_enable ? 0x02 : 0x00;
+    bytes[3] = 0x00;
+    bytes[4] = 0x00;
+    log_tx_message(0x2B2, bytes, 5);
+    if (!can_bus->sendMessage(0x2B2, bytes, 5)) {
+      DEBUG_SERIAL.println("ERROR: Failed to send 0x2B2");
+    }
+  } else {
+    // 3-byte variant (US version - older firmware)
+    uint8_t bytes[3];
+    bytes[0] = charge_power_w & 0xFF;
+    bytes[1] = charge_power_w >> 8;
+    bytes[2] = charge_enable ? 0x02 : 0x00;
+    log_tx_message(0x2B2, bytes, 3);
+    if (!can_bus->sendMessage(0x2B2, bytes, 3)) {
+      DEBUG_SERIAL.println("ERROR: Failed to send 0x2B2");
+    }
+  }
 }
 
 void PCSCan::Msg321() {
@@ -406,7 +518,10 @@ void PCSCan::Msg321() {
   bytes[5] = 0x7F;
   bytes[6] = 0x00;
   bytes[7] = 0x00;
-  can_bus->sendMessage(0x321, bytes, 8);
+  log_tx_message(0x321, bytes, 8);
+  if (!can_bus->sendMessage(0x321, bytes, 8)) {
+    DEBUG_SERIAL.println("ERROR: Failed to send 0x321");
+  }
 }
 
 void PCSCan::Msg333() {
@@ -418,7 +533,9 @@ void PCSCan::Msg333() {
   bytes[2] = 0x29;
   bytes[3] = 0x07;
   log_tx_message(0x333, bytes, 4);
-  can_bus->sendMessage(0x333, bytes, 4);
+  if (!can_bus->sendMessage(0x333, bytes, 4)) {
+    DEBUG_SERIAL.println("ERROR: Failed to send 0x333");
+  }
 }
 
 void PCSCan::Msg3A1() {
@@ -435,7 +552,9 @@ void PCSCan::Msg3A1() {
   bytes[6] = 0x12;
   bytes[7] = 0x5A;
   log_tx_message(0x3A1, bytes, 8);
-  can_bus->sendMessage(0x3A1, bytes, 8);
+  if (!can_bus->sendMessage(0x3A1, bytes, 8)) {
+    DEBUG_SERIAL.println("ERROR: Failed to send 0x3A1");
+  }
 }
 
 void PCSCan::Msg3B2() {
@@ -451,7 +570,9 @@ void PCSCan::Msg3B2() {
     bytes[5] = 0x66;
     bytes[6] = 0xBB;
     bytes[7] = 0x11;
-    can_bus->sendMessage(0x3B2, bytes, 8);
+    if (!can_bus->sendMessage(0x3B2, bytes, 8)) {
+      DEBUG_SERIAL.println("ERROR: Failed to send 0x3B2");
+    }
     mux_state.mux_3b2 = false;
   }
   else {
@@ -463,7 +584,9 @@ void PCSCan::Msg3B2() {
     bytes[5] = 0x66;
     bytes[6] = 0xBB;
     bytes[7] = 0x06;
-    can_bus->sendMessage(0x3B2, bytes, 8);
+    if (!can_bus->sendMessage(0x3B2, bytes, 8)) {
+      DEBUG_SERIAL.println("ERROR: Failed to send 0x3B2");
+    }
     mux_state.mux_3b2 = true;
   }
 }
@@ -481,7 +604,9 @@ void PCSCan::Msg545() {
     bytes[5] = 0x01;
     bytes[6] = (mux_state.count_545 << 4) | 0xA;
     bytes[7] = calc_checksum(bytes, 0x545);
-    can_bus->sendMessage(0x545, bytes, 8);
+    if (!can_bus->sendMessage(0x545, bytes, 8)) {
+      DEBUG_SERIAL.println("ERROR: Failed to send 0x545");
+    }
     mux_state.mux_545 = false;
   }
   else {
@@ -493,7 +618,9 @@ void PCSCan::Msg545() {
     bytes[5] = 0x00;
     bytes[6] = (mux_state.count_545 << 4);
     bytes[7] = calc_checksum(bytes, 0x545);
-    can_bus->sendMessage(0x545, bytes, 8);
+    if (!can_bus->sendMessage(0x545, bytes, 8)) {
+      DEBUG_SERIAL.println("ERROR: Failed to send 0x545");
+    }
     mux_state.mux_545 = true;
   }
   mux_state.count_545++;
