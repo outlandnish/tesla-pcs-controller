@@ -31,7 +31,7 @@
 // ==================== STATIC MEMBER DEFINITIONS (transport only) ====================
 
 CANBus* PCSCan::can_bus = nullptr;
-PCSMode PCSCan::current_mode = PCS_MODE_OFF;
+PCSMode PCSCan::current_mode = PCS_MODE_DCDC_ONLY;  // CRITICAL: DCDC must be enabled for interface to respond
 bool PCSCan::charge_enable = false;
 uint8_t PCSCan::clear_faults_counter = 0;
 bool PCSCan::use_long_msg_format = true;
