@@ -490,7 +490,7 @@ void PCSController::process_command_queue() {
 
 void PCSController::send_10ms_messages() {
   if (!can_enabled_) return;
-  // PCSCan::Msg13D();  // CP_chargeStatus - NOT in real trace, disabled for testing
+  PCSCan::Msg13D();  // CP_chargeStatus - needed to prevent PCS_a023_cpMia
   PCSCan::Msg20A();  // HVP_contactorState (DBC: 10ms cycle)
   PCSCan::Msg22A();
   PCSCan::Msg3B2();
@@ -516,9 +516,9 @@ void PCSController::send_100ms_messages() {
   PCSCan::Msg212();   // BMS_status (DBC: 100ms)
   PCSCan::Msg21D();   // CP_evseStatus (DBC: 100ms)
   PCSCan::Msg232();
-  // PCSCan::Msg23D();  // Unknown - NOT in real trace, disabled for testing
+  PCSCan::Msg23D();   // Unknown - needed to prevent alerts
   PCSCan::Msg25D();   // CP_unknown (removing this causes PCS_a023_cpMia)
-  // PCSCan::Msg2B2(control_params_.charge_power_w);  // BMS_chargerRequest - NOT in real trace, disabled for testing
+  PCSCan::Msg2B2(control_params_.charge_power_w);  // BMS_chargerRequest (DBC: 100ms) - needed to prevent PCS_a022_bmsMia
   PCSCan::Msg2F1();   // VCFRONT_eFuseDebugStatus (DBC: 100ms)
 }
 
