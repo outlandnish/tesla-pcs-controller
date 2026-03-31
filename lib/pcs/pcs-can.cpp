@@ -1050,50 +1050,27 @@ void PCSCan::Msg301() {
 
 void PCSCan::Msg321() {
   // DBC: BO_ 801 VCFRONT_sensors: 8 VEH (decimal 801 = 0x321 hex) - 1000ms cycle
-  //  SG_ VCFRONT_tempCoolantBatInlet: 0|10@1+ (0.125,-40) "degC"
-  //  SG_ VCFRONT_tempCoolantPTInlet: 10|11@1+ (0.125,-40) "degC"
-  //  SG_ VCFRONT_brakeFluidLevel: 22|2@1+ (1,0) ""
-  //  SG_ VCFRONT_coolantLevel: 21|1@1+ (1,0) ""
-  //  SG_ VCFRONT_tempAmbient: 24|8@1+ (0.5,-40) "degC"
-  //  SG_ VCFRONT_washerFluidLevel: 32|2@1+ (1,0) ""
-  //  SG_ VCFRONT_tempAmbientFiltered: 40|8@1+ (0.5,-40) "degC"
-  //  SG_ VCFRONT_battSensorIrrational: 48|1@1+ (1,0) ""
-  //  SG_ VCFRONT_ptSensorIrrational: 49|1@1+ (1,0) ""
+  // Real trace shows fixed payload with counter/checksum varying
+  // Most common pattern in stable charging: 37 DE A8 91 01 8A XX YY
   if (can_bus == nullptr) return;
 
+  static uint8_t counter_321 = 0;
   uint8_t bytes[8] = {0};
 
-  // Use default values from real trace: 37 DA A8 90 01 8A D0 C8
-  // Coolant Bat Inlet: 30.9°C = 567 raw = 0x237
-  uint16_t coolant_bat = 567;
-  bytes[0] = coolant_bat & 0xFF;
-  bytes[1] = (bytes[1] & 0xFC) | ((coolant_bat >> 8) & 0x03);
+  // Use fixed payload from real trace (most common pattern: 37 DE A8 91 01 8A)
+  bytes[0] = 0x37;
+  bytes[1] = 0xDE;
+  bytes[2] = 0xA8;
+  bytes[3] = 0x91;
+  bytes[4] = 0x01;
+  bytes[5] = 0x8A;
 
-  // Coolant PT Inlet: 0.8°C = 326 raw = 0x146
-  uint16_t coolant_pt = 326;
-  bytes[1] |= ((coolant_pt & 0x07) << 2);
-  bytes[2] = (coolant_pt >> 3) & 0xFF;
+  // Byte 6: Counter at bits 52-55 (upper nibble)
+  bytes[6] = ((counter_321 & 0x0F) << 4);
+  counter_321 = (counter_321 + 1) & 0x0F;
 
-  // Coolant level: bit 21 = 1 (full)
-  bytes[2] |= (1 << 5);
-
-  // Brake fluid level: bits 22-23 = 2
-  bytes[2] |= (2 << 6);
-
-  // Ambient temp: 32°C = 144 raw (scale 0.5: (32+40)*2 = 144)
-  bytes[3] = 144;
-
-  // Washer fluid: bits 32-33 = 1
-  bytes[4] = (1 << 0);
-
-  // Ambient filtered: 29°C = 138 raw (scale 0.5: (29+40)*2 = 138)
-  bytes[5] = 138;
-
-  // Sensor flags: bits 48-49 = 0 (both OK)
-  bytes[6] = 0x00;
-
-  // Checksum/counter byte (varies in trace, use fixed value)
-  bytes[7] = 0xC8;
+  // Byte 7: Checksum
+  bytes[7] = calc_checksum(bytes, 0x321);
 
   log_tx_message(0x321, bytes, 8);
   if (!can_bus->sendMessage(0x321, bytes, 8)) {
