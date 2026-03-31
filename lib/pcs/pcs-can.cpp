@@ -1210,35 +1210,40 @@ void PCSCan::Msg3B2() {
 
 void PCSCan::Msg221() {
   // DBC: BO_ 545 VCFRONT_LVPowerState: 8 VEH (decimal 545 = 0x221 hex) - 50ms cycle
-  // VCFRONT simulated response (since no real VCFront in EV conversion)
+  // Multiplexed message with 2 pages (mux 0 and 1)
+  // CRITICAL: This message signals LV power availability to PCS - needed for DCDC regulation
+  // Real trace shows fixed payloads for mux 0/1 with separate rotating counters
   if (can_bus == nullptr) return;
 
+  static uint8_t counter_mux0 = 0;
+  static uint8_t counter_mux1 = 0;
   static uint8_t mux_221 = 0;
-  static uint8_t counter_221 = 0;
   uint8_t bytes[8] = {0};
 
-  VehiclePowerState vehicle_power_state = VEHICLE_POWER_OFF;
-  bytes[0] = (mux_221 & 0x1F) | ((vehicle_power_state & 0x03) << 5);
-
   if (mux_221 == 0) {
-    // Mux 0: All systems OFF
-    LVState all_off = LV_OFF;
-    bytes[1] = all_off | (all_off << 2) | (all_off << 4) | (all_off << 6);
-    bytes[2] = all_off | (all_off << 2) | (all_off << 4) | (all_off << 6);
-    bytes[3] = all_off | (all_off << 2) | (all_off << 4) | (all_off << 6);
-    bytes[4] = all_off | (all_off << 2) | (all_off << 4) | (all_off << 6);
-    bytes[5] = all_off | (all_off << 2) | (all_off << 4) | (all_off << 6);
-    bytes[6] = all_off | (all_off << 2);
+    // Mux 0: Real trace payload = 40 41 05 15 00 50
+    bytes[0] = 0x40;  // Mux 0, vehicle power state OFF
+    bytes[1] = 0x41;
+    bytes[2] = 0x05;
+    bytes[3] = 0x15;
+    bytes[4] = 0x00;
+    bytes[5] = 0x50;
+    // Counter at bits 52-55 (byte 6, upper nibble)
+    bytes[6] = ((counter_mux0 & 0x0F) << 4);
+    counter_mux0 = (counter_mux0 + 1) & 0x0F;
   } else {
-    // Mux 1: PCS ON
-    bytes[1] = LV_ON | (LV_GOING_DOWN << 2) | (LV_OFF << 4) | (LV_ON << 6);
-    bytes[2] = LV_ON;  // pcsLVState
-    bytes[6] = 0;
+    // Mux 1: Real trace payload = 41 01 55 51 01 02
+    // Bit 16 (byte 2, bits 0-1) = pcsLVState signals LV power available to PCS
+    bytes[0] = 0x41;  // Mux 1, vehicle power state = 2 (ACCESSORY)
+    bytes[1] = 0x01;
+    bytes[2] = 0x55;
+    bytes[3] = 0x51;
+    bytes[4] = 0x01;
+    bytes[5] = 0x02;
+    // Counter at bits 52-55 (byte 6, upper nibble)
+    bytes[6] = ((counter_mux1 & 0x0F) << 4);
+    counter_mux1 = (counter_mux1 + 1) & 0x0F;
   }
-
-  // Add counter at bits 52-55 (byte 6 bits 4-7)
-  bytes[6] |= ((counter_221 & 0x0F) << 4);
-  counter_221 = (counter_221 + 1) & 0x0F;
 
   bytes[7] = calc_checksum(bytes, 0x221);
   log_tx_message(0x221, bytes, 8);
@@ -1247,7 +1252,7 @@ void PCSCan::Msg221() {
     DEBUG_SERIAL.println("ERROR: Failed to send 0x221");
   }
 
-  mux_221 = !mux_221;
+  mux_221 = !mux_221;  // Toggle between mux 0 and 1
 }
 
 void PCSCan::Msg201() {
