@@ -67,6 +67,9 @@ void readInputs();
 void updateParameters();
 void openinv_task(void *pvParameters);
 void buildParameterJson();
+void processSerialCommands();
+void printDebugHelp();
+void printDebugStatus();
 
 // Pre-generated parameter JSON for web interface
 String parameterJson;
@@ -268,7 +271,8 @@ void setup() {
   }
   Serial.println("OpenInverter task started");
 
-  Serial.println("\n*** Initialization complete - Starting RTOS ***\n");
+  Serial.println("\n*** Initialization complete - Starting RTOS ***");
+  Serial.println("Press '?' for debug commands\n");
 
   // Start FreeRTOS scheduler (this should never return)
   vTaskStartScheduler();
@@ -387,10 +391,11 @@ void updateParameters() {
 
   // Get temperature data (already converted to °C per DBC)
   const TemperatureData& temps = PCSController::get_temperature_data();
-  Param::SetFloat(Param::ChgATemp, temps.phase_a_c);
-  Param::SetFloat(Param::ChgBTemp, temps.phase_b_c);
-  Param::SetFloat(Param::ChgCTemp, temps.phase_c_c);
-  Param::SetFloat(Param::DCDCTemp, temps.dcdc_c);
+  constexpr float TEMP_INVALID = -999.0f;
+  if (temps.phase_a_c > TEMP_INVALID) Param::SetFloat(Param::ChgATemp, temps.phase_a_c);
+  if (temps.phase_b_c > TEMP_INVALID) Param::SetFloat(Param::ChgBTemp, temps.phase_b_c);
+  if (temps.phase_c_c > TEMP_INVALID) Param::SetFloat(Param::ChgCTemp, temps.phase_c_c);
+  if (temps.dcdc_c > TEMP_INVALID)    Param::SetFloat(Param::DCDCTemp, temps.dcdc_c);
   
   // Re-enable interrupts
   taskEXIT_CRITICAL();
@@ -420,10 +425,11 @@ void openinv_task(void *pvParameters) {
   PCSController::set_hv_voltage_async(Param::GetInt(Param::udcspnt));
   PCSController::set_dcdc_voltage_async(Param::GetFloat(Param::udcdc));
   PCSController::set_ac_current_limit_async(Param::GetInt(Param::iaclim));
-  
+  PCSController::set_charge_termination_percent_async(Param::GetInt(Param::chgtermn));
+
   // Note: EVSE/cable limits (0x21D) are read from external sources, not set by params
   // Note: idclim/udclim are for reference only, actual limits handled by PCS internally
-  // Note: pcstype affects message format but doesn't require immediate sync
+  // Note: 0x2B2 message format is auto-detected via CAN rationality errors
 
   uint32_t lastSecond = 0;
 
@@ -442,6 +448,9 @@ void openinv_task(void *pvParameters) {
       // Toggle LED to show we're alive
       digitalWrite(PIN_LED, !digitalRead(PIN_LED));
     }
+
+    // Process serial debug commands
+    processSerialCommands();
 
     // Read hardware inputs
     readInputs();
@@ -505,6 +514,174 @@ void openinv_task(void *pvParameters) {
   }
 }
 
+// Debug serial command help
+void printDebugHelp() {
+  DEBUG_SERIAL.println("\n=== PCS Debug Commands ===");
+  DEBUG_SERIAL.println("  m - Enter manual mode (disable state machine)");
+  DEBUG_SERIAL.println("  a - Return to auto mode (enable state machine)");
+  DEBUG_SERIAL.println("  p - Toggle PCS Enable pin");
+  DEBUG_SERIAL.println("  c - Toggle Charge Enable pin");
+  DEBUG_SERIAL.println("  d - Toggle DCDC Enable pin");
+  DEBUG_SERIAL.println("  n - Toggle CAN messages");
+  DEBUG_SERIAL.println("  s - Print current status");
+  DEBUG_SERIAL.println("  f - Clear PCS faults");
+  DEBUG_SERIAL.println("  1 - Start charging (auto mode)");
+  DEBUG_SERIAL.println("  2 - Start drive mode (auto mode)");
+  DEBUG_SERIAL.println("  0 - Stop (auto mode)");
+  DEBUG_SERIAL.println("  e - Print active alerts");
+  DEBUG_SERIAL.println("  i - Print PCS hardware info");
+  DEBUG_SERIAL.println("  y - Print DCDC state");
+  DEBUG_SERIAL.println("  x - Print AC/charge state");
+  DEBUG_SERIAL.println("  ? - Show this help");
+  DEBUG_SERIAL.println("==========================\n");
+}
+
+// Print current debug status
+void printDebugStatus() {
+  DEBUG_SERIAL.println("\n=== PCS Status ===");
+  DEBUG_SERIAL.printf("  Mode: %s\n", PCSController::is_manual_mode() ? "MANUAL" : "AUTO");
+  DEBUG_SERIAL.printf("  State: %d\n", (int)PCSController::get_state());
+  DEBUG_SERIAL.println("  --- Enables ---");
+  DEBUG_SERIAL.printf("  PCS Enable:    %s\n", PCSController::is_pcs_enabled() ? "ON" : "OFF");
+  DEBUG_SERIAL.printf("  Charge Enable: %s\n", PCSController::is_charge_enabled() ? "ON" : "OFF");
+  DEBUG_SERIAL.printf("  DCDC Enable:   %s\n", PCSController::is_dcdc_enabled() ? "ON" : "OFF");
+  DEBUG_SERIAL.printf("  CAN Enabled:   %s\n", PCSController::is_can_enabled() ? "ON" : "OFF");
+  DEBUG_SERIAL.println("  --- Voltages ---");
+  const VoltageData& v = PCSController::get_voltage_data();
+  DEBUG_SERIAL.printf("  HV: %.1fV  LV: %.1fV\n", v.hv_v, v.lv_v);
+  DEBUG_SERIAL.println("  --- Charger ---");
+  const ChargerStatus& chg = PCSController::get_charger_status();
+  DEBUG_SERIAL.printf("  Charger State: %d  Status: %d\n", chg.main_state, chg.charge_status);
+  DEBUG_SERIAL.printf("  Power Avail: %.1f kW\n", chg.max_power_available_kw);
+  DEBUG_SERIAL.println("  --- DCDC ---");
+  const DCDCStatus& dcdc = PCSController::get_dcdc_status();
+  DEBUG_SERIAL.printf("  DCDC State: %d  Faulted: %d\n", dcdc.main_state, dcdc.faulted);
+  DEBUG_SERIAL.printf("  Current: %.1fA  Power: %.1fW\n", dcdc.current_a, dcdc.power_w);
+  DEBUG_SERIAL.println("==================\n");
+}
+
+// Process serial debug commands
+void processSerialCommands() {
+  while (Serial.available() > 0) {
+    char cmd = Serial.read();
+
+    switch (cmd) {
+      case 'e':
+      case 'E':
+        DEBUG_SERIAL.println("Printing active alerts...");
+        PCSController::print_active_alerts(DEBUG_SERIAL);
+        break;
+
+      case 'y':
+      case 'Y':
+        DEBUG_SERIAL.println("Printing DCDC state...");
+        PCSController::print_dcdc_status(DEBUG_SERIAL);
+        break;
+
+      case 'x':
+      case 'X':
+        DEBUG_SERIAL.println("Printing AC/charge state...");
+        PCSController::print_ac_charge_status(DEBUG_SERIAL);
+        break;
+      case '?':
+      case 'h':
+      case 'H':
+        printDebugHelp();
+        break;
+
+      case 'm':
+      case 'M':
+        DEBUG_SERIAL.println("Entering MANUAL mode...");
+        PCSController::set_manual_mode_async(true);
+        break;
+
+      case 'a':
+      case 'A':
+        DEBUG_SERIAL.println("Returning to AUTO mode...");
+        PCSController::set_manual_mode_async(false);
+        break;
+
+      case 'p':
+      case 'P':
+        {
+          bool newState = !PCSController::is_pcs_enabled();
+          DEBUG_SERIAL.printf("Toggling PCS Enable -> %s\n", newState ? "ON" : "OFF");
+          PCSController::manual_pcs_enable_async(newState);
+        }
+        break;
+
+      case 'c':
+      case 'C':
+        {
+          bool newState = !PCSController::is_charge_enabled();
+          DEBUG_SERIAL.printf("Toggling Charge Enable -> %s\n", newState ? "ON" : "OFF");
+          PCSController::manual_charge_enable_async(newState);
+        }
+        break;
+
+      case 'd':
+      case 'D':
+        {
+          bool newState = !PCSController::is_dcdc_enabled();
+          DEBUG_SERIAL.printf("Toggling DCDC Enable -> %s\n", newState ? "ON" : "OFF");
+          PCSController::manual_dcdc_enable_async(newState);
+        }
+        break;
+
+      case 'n':
+      case 'N':
+        {
+          bool newState = !PCSController::is_can_enabled();
+          DEBUG_SERIAL.printf("Toggling CAN -> %s\n", newState ? "ON" : "OFF");
+          PCSController::manual_can_enable_async(newState);
+        }
+        break;
+
+      case 's':
+      case 'S':
+        printDebugStatus();
+        break;
+
+      case 'f':
+      case 'F':
+        DEBUG_SERIAL.println("Clearing PCS faults...");
+        PCSController::clear_faults_async();
+        break;
+
+      case '1':
+        DEBUG_SERIAL.println("Starting charging sequence...");
+        PCSController::start_charging_async();
+        break;
+
+      case '2':
+        DEBUG_SERIAL.println("Starting drive mode...");
+        PCSController::start_drive_mode_async();
+        break;
+
+
+      case 'i':
+      case 'I':
+        DEBUG_SERIAL.println("Printing PCS hardware info...");
+        PCSController::print_pcs_info();
+        break;
+
+      case '0':
+        DEBUG_SERIAL.println("Stopping...");
+        PCSController::stop_async();
+        break;
+
+      case '\r':
+      case '\n':
+        // Ignore newlines
+        break;
+
+      default:
+        DEBUG_SERIAL.printf("Unknown command: '%c' (0x%02X). Press '?' for help.\n", cmd, cmd);
+        break;
+    }
+  }
+}
+
 // Parameter change callback
 void Param::Change(Param::PARAM_NUM paramNum) {
   // Handle parameter changes
@@ -529,6 +706,11 @@ void Param::Change(Param::PARAM_NUM paramNum) {
       PCSController::set_ac_current_limit_async(Param::GetInt(Param::iaclim));
       break;
 
+    case Param::chgtermn:
+      // Update charge termination percentage
+      PCSController::set_charge_termination_percent_async(Param::GetInt(Param::chgtermn));
+      break;
+
     case Param::idclim:
       // DC current limit - stored for reference, actual limit controlled by PCS
       // No direct setter needed as PCS handles this internally
@@ -537,11 +719,6 @@ void Param::Change(Param::PARAM_NUM paramNum) {
     case Param::udclim:
       // DC voltage limit - stored for reference, actual limit controlled by PCS
       // No direct setter needed as PCS handles this internally
-      break;
-
-    case Param::pcstype:
-      // PCS Region (0=US, 1=EU) - affects 0x2B2 message format
-      // No immediate action needed - next Msg2B2() call will use new format
       break;
 
     case Param::modectl:
@@ -560,6 +737,19 @@ void Param::Change(Param::PARAM_NUM paramNum) {
             break;
           default:
             break;
+        }
+      }
+      break;
+
+    case Param::clearfaults:
+      {
+        // Clear PCS faults when set to 1, auto-reset to 0
+        int val = Param::GetInt(Param::clearfaults);
+        if (val == 1) {
+          Serial.println("Clearing PCS faults...");
+          PCSController::clear_faults_async();
+          // Auto-reset to 0 (use SetInt to avoid recursive Change callback)
+          Param::SetInt(Param::clearfaults, 0);
         }
       }
       break;

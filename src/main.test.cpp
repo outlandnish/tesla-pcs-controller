@@ -28,6 +28,10 @@ const uint32_t STARTUP_DELAY_MS = 1000;  // Delay before activation
 const uint32_t RUN_TIME_MS = 10000;      // Run for 10 seconds
 const uint32_t STOP_TIME_MS = 2000;      // Shutdown delay
 
+
+// --- PCS Info from CAN ---
+#include "pcs.h"
+
 void setup() {
   Debug.begin(115200);
   delay(100);
@@ -57,14 +61,29 @@ void setup() {
   Debug.println("\n=== State: OFF ===");
 }
 
+void printPCSInfo() {
+  const PCSInfoData& info = PCSController::get_pcs_info();
+  Debug.println("\n--- PCS Info (from CAN) ---");
+  if (info.info_valid) {
+    Debug.print("Build Type: "); Debug.println(info.build_type);
+    Debug.print("Hardware ID: "); Debug.println(info.hardware_id);
+    Debug.print("Component ID: "); Debug.println(info.component_id);
+    Debug.print("Platform Type: "); Debug.println(info.platform_type);
+    Debug.print("App CRC: 0x"); Debug.println(info.app_crc, HEX);
+    Debug.print("Part Number: "); Debug.println(info.part_number);
+
+  } else {
+    Debug.println("No PCS_info CAN message received yet.");
+  }
+  Debug.println("----------------\n");
+}
+
+// State machine implementation
 void stateMachine() {
   uint32_t now = millis();
   uint32_t timeInState = now - stateEntryTime;
-
   switch (currentState) {
     case STATE_OFF:
-      // Initial state - all outputs disabled
-      // Wait for enable signal
       if (simulateEnablePin) {
         Debug.println("Enable signal received");
         currentState = STATE_WAITSTART;
@@ -80,21 +99,17 @@ void stateMachine() {
         currentState = STATE_ACTIVATE;
         stateEntryTime = now;
         Debug.println("\n=== State: ACTIVATE ===");
-        
         // Skip ENABLE state (no precharge, no hvena_out)
         // Go directly to activating PCS and charger/DCDC
         Debug.println("Activating PCS...");
         digitalWrite(PIN_PCS_ENABLE, LOW);  // Enable PCS (active low)
         Debug.println("  PIN_PCS_ENABLE = LOW (PCS enabled)");
-        
         Debug.println("Activating Charger...");
         digitalWrite(PIN_CHARGE_ENABLE, LOW);  // Enable Charger (active low)
         Debug.println("  PIN_CHARGE_ENABLE = LOW (Charger enabled)");
-        
         Debug.println("Activating DCDC...");
         digitalWrite(PIN_DCDC_ENABLE, LOW);  // Enable DCDC (active low)
         Debug.println("  PIN_DCDC_ENABLE = LOW (DCDC enabled)");
-        
         digitalWrite(PIN_LED, HIGH);  // LED on = running
       } else {
         Debug.printf("Waiting for startup delay... (%lu/%lu ms)\r\n", 
@@ -122,14 +137,12 @@ void stateMachine() {
       // - Send CAN messages to PCS
       // - Monitor voltages and currents
       // - Check for faults
-      
       // Blink LED to show running
       if ((timeInState % 1000) < 100) {
         digitalWrite(PIN_LED, LOW);
       } else {
         digitalWrite(PIN_LED, HIGH);
       }
-      
       // Check for stop condition
       if (!simulateEnablePin) {
         Debug.println("Enable signal removed - stopping");
@@ -155,16 +168,13 @@ void stateMachine() {
       // Shutdown sequence
       if (timeInState >= STOP_TIME_MS) {
         Debug.println("Shutdown delay complete - disabling all outputs");
-        
         digitalWrite(PIN_PCS_ENABLE, HIGH);     // Disable PCS
         digitalWrite(PIN_CHARGE_ENABLE, HIGH);  // Disable Charger  
         digitalWrite(PIN_DCDC_ENABLE, HIGH);    // Disable DCDC
         digitalWrite(PIN_LED, LOW);             // LED off
-        
         Debug.println("  PIN_PCS_ENABLE = HIGH (PCS disabled)");
         Debug.println("  PIN_CHARGE_ENABLE = HIGH (Charger disabled)");
         Debug.println("  PIN_DCDC_ENABLE = HIGH (DCDC disabled)");
-        
         currentState = STATE_OFF;
         stateEntryTime = now;
         Debug.println("\n=== State: OFF ===");
@@ -182,19 +192,27 @@ void stateMachine() {
   }
 }
 
-void loop() {
-  // Run state machine
-  stateMachine();
-  
-  // Simulate enable signal for testing
-  // In STATE_OFF, trigger enable after 2 seconds
-  if (currentState == STATE_OFF && !simulateEnablePin) {
-    uint32_t timeInOff = millis() - stateEntryTime;
-    if (timeInOff >= 2000) {
-      Debug.println("TEST: Simulating enable signal (manual mode)");
-      simulateEnablePin = true;
+// Simple command parser for serial input (add 'info' command)
+void handleSerialCommands() {
+  if (Debug.available()) {
+    String cmd = Debug.readStringUntil('\n');
+    cmd.trim();
+    if (cmd.equalsIgnoreCase("info")) {
+      printPCSInfo();
+    } else {
+      Debug.println("Unknown command. Try 'info'.");
     }
   }
-  
+}
+
+void loop() {
+
+
+  // Handle serial commands
+  handleSerialCommands();
+
+  // Run state machine
+  stateMachine();
+
   delay(50);  // Main loop delay
 }

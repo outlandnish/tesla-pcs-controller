@@ -25,6 +25,13 @@ typedef enum
    ERROR_LAST
 } ERROR_TYPE;
 
+struct ErrorDescriptor {
+   const char* msg;
+   ERROR_TYPE type;
+};
+
+extern const struct ErrorDescriptor errorDescriptors[];
+
 class ErrorMessage
 {
 public:

@@ -51,6 +51,7 @@
 #define UDCSPNT_DEFAULT 403
 #define UDCDC_DEFAULT 14
 #define IACLIM_DEFAULT 16
+#define CHGTERMN_DEFAULT 80
 
 // Parameter and value definitions
 /*              category     displayName           name         unit       min     max     default id */
@@ -61,12 +62,13 @@
   PARAM_ENTRY(CAT_CHARGER, "DC Voltage Setpoint", udcspnt, "V", 50, 420, UDCSPNT_DEFAULT, 6) \
   PARAM_ENTRY(CAT_CHARGER, "DC Voltage Limit", udclim, "V", 50, 420, 398, 7) \
   PARAM_ENTRY(CAT_CHARGER, "Time Limit", timelim, "minutes", -1, 10000, -1, 8) \
+  PARAM_ENTRY(CAT_CHARGER, "Charge Termination", chgtermn, "%", 0, 100, CHGTERMN_DEFAULT, 9) \
   PARAM_ENTRY(CAT_CHARGER, "Input Type", inputype, INPUTS, 0, 3, 0, 10) \
   PARAM_ENTRY(CAT_CHARGER, "Activate Devices", activate, DEVS, 0, 3, 3, 14) \
-  PARAM_ENTRY(CAT_CHARGER, "PCS Region", pcstype, PCSREGION, 0, 1, 0, 13) \
   PARAM_ENTRY(CAT_DCDC, "DC/DC Voltage", udcdc, "V", 12, 15, UDCDC_DEFAULT, 15) \
   PARAM_ENTRY(CAT_DCDC, "Precharge Time", PreChT, "sec", 1, 10, 3, 23) \
   PARAM_ENTRY(CAT_DIAG, "Mode Control", modectl, OPMODES, 0, 2, 0, 30) \
+  PARAM_ENTRY(CAT_DIAG, "Clear Faults", clearfaults, OFFON, 0, 1, 0, 31) \
   VALUE_ENTRY("Operating Mode", opmode, OPMODES, 2000) \
   VALUE_ENTRY("State", state, STATES, 2001) \
   VALUE_ENTRY("Last Error", lasterr, "", 2002) \
@@ -101,7 +103,6 @@
 /***** Enum String definitions *****/
 #define OPMODES "0=Off, 1=Run, 2=Drive"
 #define OFFON "0=Off, 1=On"
-#define PCSREGION "0=US, 1=EU"
 #define TYPES "0=48A_1P, 1=32A_1P, 2=16A_3P"
 #define GCFG "0=None, 1=1P, 2=3P, 3=3PD"
 #define STATES "0=Off, 1=WaitStart, 2=Enable, 3=Activate, 4=Run, 5=Stop, 6=DRIVE"

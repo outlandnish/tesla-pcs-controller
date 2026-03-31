@@ -5,12 +5,6 @@
 #include "errormessage.h"
 #include "debug_serial.h"
 
-struct ErrorDescriptor
-{
-   const char* msg;
-   ERROR_TYPE type;
-};
-
 struct BufferEntry
 {
    ERROR_MESSAGE_NUM msg;
@@ -18,7 +12,7 @@ struct BufferEntry
 };
 
 #define ERROR_MESSAGE_ENTRY(id, type) { #id, type },
-static const struct ErrorDescriptor errorDescriptors[] =
+const struct ErrorDescriptor errorDescriptors[] =
 {
    { "", ERROR_LAST },
    ERROR_MESSAGE_LIST

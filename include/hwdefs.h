@@ -11,8 +11,13 @@
  */
 
 // Control Outputs
-#define PIN_CHARGE_ENABLE  PB10  // Pin 21 - Charger Enable (active low)
-#define PIN_DCDC_ENABLE    PB12  // Pin 25 - DCDC Enable (active low)
+
+// temporarily swapped for CHARGE_ENABLE and DCDC_ENABLE due to connector pin swap
+// #define PIN_CHARGE_ENABLE  PB10  // Pin 21 - Charger Enable (active low)
+// #define PIN_DCDC_ENABLE    PB12  // Pin 25 - DCDC Enable (active low)
+#define PIN_CHARGE_ENABLE  PB12  // Pin 25 - Charger Enable (active low)
+#define PIN_DCDC_ENABLE    PB10  // Pin 21 - DCDC Enable (active
+
 // #define PIN_PCS_ENABLE     PB14  // Pin 27 - PCS Enable
 #define PIN_PCS_ENABLE PB9 // Temporary change because of damaged pin on test board
 #define PIN_EVSE_SWITCH    PB15  // Pin 28 - EVSE Switch
