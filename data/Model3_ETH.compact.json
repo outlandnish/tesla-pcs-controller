@@ -9765,7 +9765,7 @@
           "units": "",
           "value_description": {
             "Mux0": 0,
-            "Mux1": 1
+            "Mux1": 11
           },
           "value_table_name": "VCFRONT_LVPowerStateMux",
           "width": 5

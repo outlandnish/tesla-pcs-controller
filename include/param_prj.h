@@ -65,7 +65,8 @@
   PARAM_ENTRY(CAT_CHARGER, "Charge Termination", chgtermn, "%", 0, 100, CHGTERMN_DEFAULT, 9) \
   PARAM_ENTRY(CAT_CHARGER, "Input Type", inputype, INPUTS, 0, 3, 0, 10) \
   PARAM_ENTRY(CAT_CHARGER, "Activate Devices", activate, DEVS, 0, 3, 3, 14) \
-  PARAM_ENTRY(CAT_DCDC, "DC/DC Voltage", udcdc, "V", 12, 15, UDCDC_DEFAULT, 15) \
+  PARAM_ENTRY(CAT_DCDC, "DC/DC Voltage", udcdc, "V", 12, 17, UDCDC_DEFAULT, 15) \
+  PARAM_ENTRY(CAT_DCDC, "LV Battery Type", lv_bat_type, LVBATTYPES, 0, 1, 0, 16) \
   PARAM_ENTRY(CAT_DCDC, "Precharge Time", PreChT, "sec", 1, 10, 3, 23) \
   PARAM_ENTRY(CAT_DIAG, "Mode Control", modectl, OPMODES, 0, 2, 0, 30) \
   PARAM_ENTRY(CAT_DIAG, "Clear Faults", clearfaults, OFFON, 0, 1, 0, 31) \
@@ -108,6 +109,7 @@
 #define STATES "0=Off, 1=WaitStart, 2=Enable, 3=Activate, 4=Run, 5=Stop, 6=DRIVE"
 #define INPUTS "0=Type2, 1=Type2_3P, 2=Type1, 3=Manual"
 #define DEVS "0=None, 1=Charger, 2=DC-DC, 3=Both"
+#define LVBATTYPES "0=12V_LeadAcid, 1=16V_LiIon"
 #define C_STAT "0=Init, 1=Idle, 2=Startup, 3=WaitAC, 4=Qualify, 5=Config, 6=Enable, 7=Shutdown, 8=Faulted, 9=CLRFaults"
 
 // Parameter categories

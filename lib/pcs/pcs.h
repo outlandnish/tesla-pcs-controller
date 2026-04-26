@@ -267,6 +267,9 @@ private:
   static DCDCBusStatus dcdc_bus_status_;
   static ACStatus ac_status_;
   static TemperatureData temperature_data_;
+
+  // CAN startup delay (prevent send failures when CAN bus not ready)
+  static uint16_t can_startup_delay_ms_;
   static VoltageData voltage_data_;
   static DCCurrentData dc_current_data_;
   static ControlParams control_params_;

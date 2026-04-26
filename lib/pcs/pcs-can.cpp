@@ -51,20 +51,29 @@ MuxState PCSCan::mux_state = {
   .mux_545 = false,
   .count_545 = 0,
   .count_3a1 = 0,
+  .count_441 = 0,
+  .mux_441 = false,
+  .quad_msg_441 = 0,
+  .count_443 = 0,
   .mux_2c4 = 0,
-  .got_dci = false
+  .got_dci = false,
+  .mux_677 = 0,
+  .mux_718 = 0,
+  .count_718 = 0
 };
 
 // ==================== HELPER FUNCTIONS ====================
 
-static void log_rx_message(uint32_t id, const uint32_t data[2]) {
+static void log_rx_message(uint32_t id, const uint32_t data[2], uint8_t len) {
   #if DEBUG_PCS_RX
   const uint8_t* bytes = (const uint8_t*)data;
   DEBUG_SERIAL.print("IPC RX: 0x");
   if (id < 0x100) DEBUG_SERIAL.print("0");
   if (id < 0x10) DEBUG_SERIAL.print("0");
   DEBUG_SERIAL.print(id, HEX);
-  DEBUG_SERIAL.print(" [8] ");
+  DEBUG_SERIAL.print(" [");
+  DEBUG_SERIAL.print(len);
+  DEBUG_SERIAL.print("] ");
   for (uint8_t i = 0; i < 8; i++) {
     if (bytes[i] < 0x10) DEBUG_SERIAL.print("0");
     DEBUG_SERIAL.print(bytes[i], HEX);
@@ -111,19 +120,19 @@ void PCSCan::process_messages() {
   while (can_bus->receiveMessage(can_id, data, len)) {
     uint32_t data_words[2];
     memcpy(data_words, data, 8);
-    process_frame(can_id, data_words);
+    process_frame(can_id, data_words, len);
   }
 }
 
-void PCSCan::process_frame(uint32_t can_id, uint32_t data[2]) {
-  log_rx_message(can_id, data);
+void PCSCan::process_frame(uint32_t can_id, uint32_t data[2], uint8_t len) {
+  log_rx_message(can_id, data, len);
 
   switch (can_id) {
     case 0x204: handle204(data); break;
     case 0x224: handle224(data); break;
     case 0x264: handle264(data); break;
     case 0x2A4: handle2A4(data); break;
-    case 0x2B4: handle2B4(data); break;
+    case 0x2B4: handle2B4(data, len); break;
     case 0x2C4: handle2C4(data); break;
     case 0x3A4: handle3A4(data); break;
     case 0x3C4: handle3C4(data); break;
@@ -213,28 +222,78 @@ void PCSCan::handle2A4(uint32_t data[2]) {
   PCSController::update_temperature_data(temp);
 }
 
-void PCSCan::handle2B4(uint32_t data[2]) {
-  // JSON: PCS_dcdcRailStatus (0x2B4) - 6 bytes
-  // PCS_dcdcLvBusVolt:      bit 0,  13-bit unsigned, scale=0.01 V
-  // PCS_dcdcLvOutputCurrent: bit 32, 13-bit signed,   scale=0.1  A
+// Parse 0x2B4 DLC=5 format (newer bench firmware)
+// Returns: DCDCBusStatus with parsed voltage/current values
+static DCDCBusStatus parse_2b4_dlc5(const uint8_t* bytes) {
+  DCDCBusStatus status = {0};
+
+  // Extract 10-bit LV voltage (bits 0-9)
+  uint16_t raw_lv_volt = (bytes[1] << 8 | bytes[0]) & 0x3FF;
+  status.lv_bus_voltage_v = raw_lv_volt * 0.0390625f;
+
+  // Extract 12-bit HV voltage (bits 10-21)
+  uint16_t raw_hv_volt = ((bytes[2] << 8 | bytes[1]) >> 2) & 0xFFF;
+  status.hv_bus_voltage_v = raw_hv_volt * 0.146484375f;
+
+  // Extract 12-bit LV current (bits 24-35)
+  uint16_t raw_lv_current = ((bytes[4] << 8 | bytes[3]) >> 0) & 0xFFF;
+  status.lv_output_current_a = raw_lv_current * 0.1f;
+
+  return status;
+}
+
+// Parse 0x2B4 DLC=6 format (older production Tesla format)
+// DBC format: 13-bit LV voltage, scale 0.01
+// Returns: DCDCBusStatus with parsed voltage/current values
+static DCDCBusStatus parse_2b4_dlc6(const uint8_t* bytes) {
+  DCDCBusStatus status = {0};
+
+  // Extract 13-bit LV voltage from bytes[0:1]
+  uint16_t raw_lv_volt = ((uint16_t)bytes[1] << 8 | bytes[0]) & 0x1FFF;
+  status.lv_bus_voltage_v = raw_lv_volt * 0.01f;
+
+  // HV and current not in this message format
+  status.hv_bus_voltage_v = 0.0f;
+  status.lv_output_current_a = 0.0f;
+
+  return status;
+}
+
+void PCSCan::handle2B4(uint32_t data[2], uint8_t dlc) {
+  // PCS_dcdcRailStatus (0x2B4 / 694)
+  // Two formats supported by DLC:
+  // DLC=5: Newer format (10-bit LV, 12-bit HV, 12-bit current)
+  // DLC=6: Older production format (TBD)
   uint8_t* bytes = (uint8_t*)data;
 
-  uint16_t raw_lv_volt = ((uint16_t)bytes[1] << 8 | bytes[0]) & 0x1FFF;
-  float lv_voltage = raw_lv_volt * 0.01f;
+  DCDCBusStatus bus_status = {0};
 
-  int16_t raw_lv_current = ((uint16_t)bytes[5] << 8 | bytes[4]) & 0x1FFF;
-  if (raw_lv_current & 0x1000) raw_lv_current |= (int16_t)0xE000;  // sign-extend 13→16 bit
-  float lv_current = raw_lv_current * 0.1f;
+  if (dlc == 5) {
+    bus_status = parse_2b4_dlc5(bytes);
+  }
+  else if (dlc == 6) {
+    bus_status = parse_2b4_dlc6(bytes);
+  } 
+  else {
+    // Unknown DLC - use defaults
+    // bus_status.lv_bus_voltage_v = 13.5f;
+    // bus_status.hv_bus_voltage_v = 0.0f;
+    // bus_status.lv_output_current_a = 0.0f;
+    DEBUG_SERIAL.printf("RX 0x2B4 (DLC=%d UNKNOWN): [%02X %02X %02X %02X %02X %02X] "
+                        "Unsupported format - using defaults\r\n",
+                        dlc, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]);
 
-  DCDCBusStatus bus_status;
-  bus_status.lv_bus_voltage_v = lv_voltage;
-  bus_status.hv_bus_voltage_v = 0.0f;  // not in this message
-  bus_status.lv_output_current_a = lv_current;
+  }
+
+  // Update DCDC bus status
   PCSController::update_dcdc_bus_status(bus_status);
 
-  PCSController::update_lv_voltage(lv_voltage);
+  // Update primary voltage data
+  PCSController::update_lv_voltage(bus_status.lv_bus_voltage_v);
+  PCSController::update_hv_voltage((uint16_t)bus_status.hv_bus_voltage_v);
 
-  PCSController::update_dcdc_current(lv_current, lv_voltage);
+  // Update DCDC current and power
+  PCSController::update_dcdc_current(bus_status.lv_output_current_a, bus_status.lv_bus_voltage_v);
 }
 
 void PCSCan::handle2C4(uint32_t data[2]) {
@@ -1012,62 +1071,84 @@ void PCSCan::Msg2F1() {
 }
 
 void PCSCan::Msg301() {
-  // DBC: BO_ 769 VCFRONT_info: 8 VEH (decimal 769 = 0x301 hex) - 1000ms cycle
-  //  SG_ VCFRONT_infoIndex M: 0|8@1+ (1,0) [0|0] "" X
-  //  Multiplexed: Contains build info, hardware IDs, CRC checksums, git hashes
-  //  Mostly static/informational, varying through different mux pages
-  if (can_bus == nullptr) return;
+  // // DBC: BO_ 769 VCFRONT_info: 8 VEH (decimal 769 = 0x301 hex) - 1000ms cycle
+  // //  SG_ VCFRONT_infoIndex M: 0|8@1+ (1,0) [0|0] "" X
+  // //  Multiplexed: Contains build info, hardware IDs, CRC checksums, git hashes
+  // //  Mostly static/informational, varying through different mux pages
+  // if (can_bus == nullptr) return;
 
-  static uint8_t mux_index = 0x10;  // Start with a valid mux value
-  uint8_t bytes[8] = {0};
+  // static uint8_t mux_index = 0x10;  // Start with a valid mux value
+  // uint8_t bytes[8] = {0};
 
-  bytes[0] = mux_index;
+  // bytes[0] = mux_index;
 
-  // For most mux values, send reasonable defaults
-  // Example: mux 0x10 (build type info)
-  if (mux_index == 0x10) {
-    bytes[1] = 0x02;  // Build type = MFG
-    bytes[2] = 0x01;  // Build config ID (low byte)
-    bytes[3] = 0x00;  // Build config ID (high byte)
-    bytes[4] = 0x01;  // Hardware ID (low byte)
-    bytes[5] = 0x00;  // Hardware ID (high byte)
-  } else {
-    // For other mux values, fill with reasonable defaults
-    for (int i = 1; i < 8; i++) {
-      bytes[i] = 0x00;
-    }
-  }
+  // // For most mux values, send reasonable defaults
+  // // Example: mux 0x10 (build type info)
+  // if (mux_index == 0x10) {
+  //   bytes[1] = 0x02;  // Build type = MFG
+  //   bytes[2] = 0x01;  // Build config ID (low byte)
+  //   bytes[3] = 0x00;  // Build config ID (high byte)
+  //   bytes[4] = 0x01;  // Hardware ID (low byte)
+  //   bytes[5] = 0x00;  // Hardware ID (high byte)
+  // } else {
+  //   // For other mux values, fill with reasonable defaults
+  //   for (int i = 1; i < 8; i++) {
+  //     bytes[i] = 0x00;
+  //   }
+  // }
 
-  // Rotate through different info pages
-  mux_index++;
-  if (mux_index > 0x1F) mux_index = 0x10;
+  // // Rotate through different info pages
+  // mux_index++;
+  // if (mux_index > 0x1F) mux_index = 0x10;
 
-  log_tx_message(0x301, bytes, 8);
-  if (!can_bus->sendMessage(0x301, bytes, 8)) {
-    DEBUG_SERIAL.println("ERROR: Failed to send 0x301");
-  }
+  // log_tx_message(0x301, bytes, 8);
+  // if (!can_bus->sendMessage(0x301, bytes, 8)) {
+  //   DEBUG_SERIAL.println("ERROR: Failed to send 0x301");
+  // }
 }
 
 void PCSCan::Msg321() {
-  // DBC: BO_ 801 VCFRONT_sensors: 8 VEH (decimal 801 = 0x321 hex) - 1000ms cycle
-  // Real trace shows fixed payload with counter/checksum varying
-  // Most common pattern in stable charging: 37 DE A8 91 01 8A XX YY
+  // VCFRONT_sensors (0x321/801): 1000ms cycle with stable thermal telemetry
+  //
+  // SIGNAL BREAKDOWN (from model3_alt.dbc):
+  //   Bits 0-9:   tempCoolantBatInlet     (10 bits, scale 0.125, offset -40°C)
+  //   Bits 10-20: tempCoolantPTInlet      (11 bits, scale 0.125, offset -40°C)
+  //   Bits 22-23: brakeFluidLevel         (2 bits)
+  //   Bits 24-31: tempAmbient             (8 bits, scale 0.5, offset -40°C)
+  //   Bits 32-33: washerFluidLevel        (2 bits)
+  //   Bits 40-47: tempAmbientFiltered     (8 bits, scale 0.5, offset -40°C)
+  //   Bits 48: battSensorIrrational       (1 bit, flag)
+  //   Bits 49: ptSensorIrrational         (1 bit, flag)
+  //   Bits 52-55: counter                 (4 bits, wraps 0-15)
+  //   Bits 56-63: checksum                (8 bits)
+  //
+  // Analysis finding: Real trace shows FIXED sensor values across all environments:
+  //   - tempCoolantBatInlet: consistently 30.9°C ± 0.3°C
+  //   - tempCoolantPTInlet: consistently 27-31°C
+  //   - tempAmbient: 30-32.5°C (vehicle interior temp, stable)
+  //   - Both sensors healthy (irrational = 0)
+  //
+  // Implementation: Use stable values from production charging trace,
+  // with counter and checksum updated per send
   if (can_bus == nullptr) return;
 
-  static uint8_t counter_321 = 0;
   uint8_t bytes[8] = {0};
 
-  // Use fixed payload from real trace (most common pattern: 37 DE A8 91 01 8A)
+  // Fixed payload template from production charging trace (37 DA A8 90 01 8A XX YY)
+  // This represents:
+  //   - Coolant Bat Inlet: 30.9°C
+  //   - Coolant PT Inlet: 30.75°C
+  //   - Ambient: 32.0°C
+  //   - Both sensors healthy
   bytes[0] = 0x37;
-  bytes[1] = 0xDE;
+  bytes[1] = 0xDA;
   bytes[2] = 0xA8;
-  bytes[3] = 0x91;
+  bytes[3] = 0x90;
   bytes[4] = 0x01;
   bytes[5] = 0x8A;
 
   // Byte 6: Counter at bits 52-55 (upper nibble)
-  bytes[6] = ((counter_321 & 0x0F) << 4);
-  counter_321 = (counter_321 + 1) & 0x0F;
+  bytes[6] = (mux_state.count_545 << 4);  // Reuse count_545 for sensor counter
 
   // Byte 7: Checksum
   bytes[7] = calc_checksum(bytes, 0x321);
@@ -1076,78 +1157,84 @@ void PCSCan::Msg321() {
   if (!can_bus->sendMessage(0x321, bytes, 8)) {
     DEBUG_SERIAL.println("ERROR: Failed to send 0x321");
   }
+
+  // Increment counter (4-bit, wraps at 15)
+  mux_state.count_545++;
+  if (mux_state.count_545 > 0x0F) mux_state.count_545 = 0;
 }
 
 void PCSCan::Msg3A1() {
-  // DBC: BO_ 929 VCFRONT_vehicleStatus: 8 VEH (decimal 929 = 0x3A1 hex) - 100ms cycle
-  //  SG_ VCFRONT_pcs12vVoltageTarget: 16|11@1+ (0.01,0) "V" - DCDC target voltage
-  //  SG_ VCFRONT_pcsEFuseVoltage: 42|10@1+ (0.1,0) "V" - eFuse measured voltage
-  //  SG_ VCFRONT_vehicleStatusCounter: 52|4@1+ - message counter
-  //  SG_ VCFRONT_vehicleStatusChecksum: 56|8@1+ - checksum
+  // VCFRONT_vehicleStatus (0x3A1/929): Multiplexed message
+  // Two mux patterns alternate: 0x08 (status) and 0xC3 (sensor data)
+  // Based on production Tesla Model 3 trace analysis from 3a1-sitting.csv
+  // Message Rate: 20 Hz (50ms period), alternating mux every message
+  
   if (can_bus == nullptr) return;
 
-  // Calculate voltage values - both should match DCDC target
-  uint16_t voltage_target_raw = (uint16_t)(control_params.dcdc_voltage_v * 100.0f);  // scale 0.01V: 14V -> 1400
-  uint16_t efuse_voltage_raw = (uint16_t)(control_params.dcdc_voltage_v * 10.0f);    // scale 0.1V: 14V -> 140
-
+  static uint8_t counter_phase_3a1 = 0;  // 3-bit phase, increments once per full mux pair
+  static uint32_t sensor_sequence = 0;  // Track sequence for sensor data variation
   uint8_t bytes[8] = {0};
+  uint8_t mux = mux_state.count_3a1 & 0x01;
 
-  // --- 12V and HV/charging system bits ---
-  // VCFRONT_bmsHvChargeEnable: bit 0
-  bool hv_charge_enable = PCSController::is_charge_enabled();
-  bytes[0] |= (hv_charge_enable ? 1 : 0);
+  if (mux == 0) {
+    // MUX 0x08: Status/Control page
+    // Fixed pattern: 08 4A 0C 0A 00 50 [COUNTER] [CHECKSUM]
+    bytes[0] = 0x08;
+    bytes[1] = 0x4A;
+    bytes[2] = 0x0C;
+    bytes[3] = 0x0A;
+    bytes[4] = 0x00;
+    bytes[5] = 0x50;  // Status byte (observed as 0x50 in trace, occasionally 0x4C)
+    bytes[6] = ((counter_phase_3a1 & 0x07) << 5) | 0x02;
+  } else {
+    // MUX 0xC3: Sensor data page
+    // Fixed pattern: C3 FF FF [SENSOR_DATA] 3E 00 [COUNTER] [CHECKSUM]
+    bytes[0] = 0xC3;
+    bytes[1] = 0xFF;
+    bytes[2] = 0xFF;
+    // Byte 3: Varies slowly in production (0x99-0xD9 range), represents sensor/voltage measurement
+    // Cycle through realistic values based on message count
+    static const uint8_t sensor_values[] = {0xB1, 0xBB, 0xBB, 0xB1, 0xAF, 0xBD, 0xA5, 0xBF};
+    bytes[3] = sensor_values[sensor_sequence % 8];
+    sensor_sequence++;
+    bytes[4] = 0x3E;
+    bytes[5] = 0x00;
+    bytes[6] = ((counter_phase_3a1 & 0x07) << 5) | 0x10;
+  }
 
-  // VCFRONT_preconditionRequest: bit 1
-  bool precondition_request = false; // TODO: set from logic
-  bytes[0] |= (precondition_request ? 1 : 0) << 1;
+  // Checksum: B7 = (sum(B0:B6) + 0xC0) & 0xFF
+  // Simple sum of all bytes 0-6, offset by 0xC0, masked to 8-bit
+  uint8_t checksum = 0;
+  for (int i = 0; i < 7; i++) {
+    checksum += bytes[i];
+  }
+  checksum = (checksum + 0xC0) & 0xFF;
+  bytes[7] = checksum;
 
-  // VCFRONT_is12VBatterySupported: bit 5
-  bool is_12v_supported = true;
-  bytes[0] |= (is_12v_supported ? 1 : 0) << 5;
-
-  // VCFRONT_standbySupplySupported: bit 6
-  bool standby_supply_supported = true; // TODO: set from logic
-  bytes[0] |= (standby_supply_supported ? 1 : 0) << 6;
-
-  // VCFRONT_12vStatusForDrive: bits 14-15 (byte 1 bits 6-7)
-  VCFRONT_12vStatusForDrive status_12v_drive = STATUS_12V_OK;
-  // Example logic: set FAULT if DCDC is faulted, WARNING if output limited, else OK
-  // if (PCSController::get_dcdc_status().faulted) {
-  //   status_12v_drive = STATUS_12V_FAULT;
-  // } else if (PCSController::get_dcdc_status().output_limited) {
-  //   status_12v_drive = STATUS_12V_WARNING;
+  #if DEBUG_PCS_CAN
+  static uint32_t debug_counter = 0;
+  // if (debug_counter++ % 10 == 0) {  // Log every 10th message to reduce spam
+    DEBUG_SERIAL.printf("3A1[mux=%s] cnt=0x%02X b3=0x%02X cksum=0x%02X: ",
+              mux == 0 ? "08" : "C3", bytes[6], bytes[3], checksum);
+    for (int i = 0; i < 8; i++) {
+      DEBUG_SERIAL.printf("%02X ", bytes[i]);
+    }
+    DEBUG_SERIAL.println();
   // }
-  bytes[1] |= (status_12v_drive & 0x03) << 6;
-
-  // Bytes 2-3: VCFRONT_pcs12vVoltageTarget at bits 16-26 (11 bits)
-  bytes[2] = voltage_target_raw & 0xFF;                 // bits 16-23
-  bytes[3] = (voltage_target_raw >> 8) & 0x07;          // bits 24-26
-
-  // VCFRONT_batterySupportRequest: bit 27 (byte 3 bit 3) — battery available for support
-  bytes[3] |= (1 << 3);
-
-  // Byte 4: Other signals
-  bytes[4] = 0x00;
-
-  // Bytes 5-6: VCFRONT_pcsEFuseVoltage at bits 42-51 (10 bits)
-  // Bit 42 = byte 5 bit 2, so efuse spans byte 5 bits 2-7 (6 bits) and byte 6 bits 0-3 (4 bits)
-  bytes[5] = (efuse_voltage_raw & 0x3F) << 2;              // bits 42-47 (low 6 bits shifted to bits 2-7)
-  bytes[6] = ((efuse_voltage_raw >> 6) & 0x0F);            // bits 48-51 (high 4 bits in bits 0-3)
-
-  // Byte 6 bits 4-7: VCFRONT_vehicleStatusCounter
-  bytes[6] |= (mux_state.count_3a1 << 4);
-
-  // Byte 7: Checksum
-  bytes[7] = calc_checksum(bytes, 0x3A1);
+  #endif
 
   log_tx_message(0x3A1, bytes, 8);
   if (!can_bus->sendMessage(0x3A1, bytes, 8)) {
     DEBUG_SERIAL.println("ERROR: Failed to send 0x3A1");
   }
 
-  // Increment counter (4-bit, wraps at 15)
+  // Increment phase once per full mux pair so both pages share the same phase.
+  if (mux == 1) {
+    counter_phase_3a1 = (counter_phase_3a1 + 1) & 0x07;
+  }
+  
+  // Alternate mux for next message
   mux_state.count_3a1++;
-  if (mux_state.count_3a1 > 0x0F) mux_state.count_3a1 = 0;
 }
 
 void PCSCan::Msg3B2() {
@@ -1187,40 +1274,31 @@ void PCSCan::Msg3B2() {
 
 void PCSCan::Msg221() {
   // DBC: BO_ 545 VCFRONT_LVPowerState: 8 VEH (decimal 545 = 0x221 hex) - 50ms cycle
-  // Multiplexed message with 2 pages (mux 0 and 1)
-  // CRITICAL: This message signals LV power availability to PCS - needed for DCDC regulation
-  // Real trace shows fixed payloads for mux 0/1 with separate rotating counters
+  // Multiplexed message with 2 pages (mux 0 and 1).
+  // Pack the documented signals directly instead of replaying trace payloads:
+  //   bits 0-4   VCFRONT_LVPowerStateIndex
+  //   bits 5-6   VCFRONT_vehiclePowerState
+  //   bits 34-35 VCFRONT_dirLVRequest (mux 0 only)
+  //   bits 52-55 VCFRONT_LVPowerStateCounter
+  //   bits 56-63 VCFRONT_LVPowerStateChecksum
   if (can_bus == nullptr) return;
 
-  static uint8_t counter_mux0 = 0;
-  static uint8_t counter_mux1 = 0;
+  static uint8_t counter_221 = 0;
   static uint8_t mux_221 = 0;
   uint8_t bytes[8] = {0};
 
-  if (mux_221 == 0) {
-    // Mux 0: Real trace payload = 40 41 05 15 00 50
-    bytes[0] = 0x40;  // Mux 0, vehicle power state OFF
-    bytes[1] = 0x41;
-    bytes[2] = 0x05;
-    bytes[3] = 0x15;
-    bytes[4] = 0x00;
-    bytes[5] = 0x50;
-    // Counter at bits 52-55 (byte 6, upper nibble)
-    bytes[6] = ((counter_mux0 & 0x0F) << 4);
-    counter_mux0 = (counter_mux0 + 1) & 0x0F;
-  } else {
-    // Mux 1: Real trace payload = 41 01 55 51 01 02
-    // Bit 16 (byte 2, bits 0-1) = pcsLVState signals LV power available to PCS
-    bytes[0] = 0x41;  // Mux 1, vehicle power state = 2 (ACCESSORY)
-    bytes[1] = 0x01;
-    bytes[2] = 0x55;
-    bytes[3] = 0x51;
-    bytes[4] = 0x01;
-    bytes[5] = 0x02;
-    // Counter at bits 52-55 (byte 6, upper nibble)
-    bytes[6] = ((counter_mux1 & 0x0F) << 4);
-    counter_mux1 = (counter_mux1 + 1) & 0x0F;
+  const uint8_t mux_index = (mux_221 == 0) ? 0x00 : 0x01;
+  const bool lv_active = (current_mode != PCS_MODE_OFF);
+  const uint8_t vehicle_power_state = lv_active ? VEHICLE_POWER_ACCESSORY : VEHICLE_POWER_OFF;
+  const uint8_t dir_lv_request = lv_active ? LV_ON : LV_OFF;
+
+  bytes[0] = (mux_index & 0x1F) | ((vehicle_power_state & 0x03) << 5);
+
+  if (mux_index == 0x00) {
+    bytes[4] |= (dir_lv_request & 0x03) << 2;
   }
+
+  bytes[6] = (counter_221 & 0x0F) << 4;
 
   bytes[7] = calc_checksum(bytes, 0x221);
   log_tx_message(0x221, bytes, 8);
@@ -1229,7 +1307,8 @@ void PCSCan::Msg221() {
     DEBUG_SERIAL.println("ERROR: Failed to send 0x221");
   }
 
-  mux_221 = !mux_221;  // Toggle between mux 0 and 1
+  counter_221 = (counter_221 + 1) & 0x0F;
+  mux_221 = !mux_221;
 }
 
 void PCSCan::Msg201() {
@@ -1454,6 +1533,182 @@ void PCSCan::Msg545() {
   if (mux_state.count_545 > 0x0F) mux_state.count_545 = 0;
 }
 
+void PCSCan::Msg443() {
+  // VC_pcsManagement (0x443) - 500ms cycle
+  // B1: 4-bit rolling counter (0x0-0xF)
+  // B2-B3: VC_dcdcLVVoltageTargetMax = 0x3FF (UNRESTRICTED, 10-bit LE)
+  // B4:    VC_dcdcLVVoltageTargetMin = 0x00  (UNRESTRICTED)
+  // B5:    VC_dcdcLVInputPowerLimit  = 0x00  (UNRESTRICTED)
+  // B0:    checksum = (sum(B1..B5) + 0x69) & 0xFF
+  // LV target signals are only relevant for LiFePO4-equipped vehicles;
+  // hardcoded to UNRESTRICTED for lead-acid 12V systems.
+  if (can_bus == nullptr) return;
+
+  uint8_t bytes[6] = {0};
+  uint8_t rolling_nibble = mux_state.count_443 & 0x0F;
+
+  bytes[1] = rolling_nibble;
+  bytes[2] = 0xFF;
+  bytes[3] = 0x03;
+  bytes[4] = 0x00;
+  bytes[5] = 0x00;
+  bytes[0] = (bytes[1] + bytes[2] + bytes[3] + bytes[4] + bytes[5] + 0x69) & 0xFF;
+  bytes[2] = 0xFF;
+  bytes[3] = 0x03;
+  bytes[4] = 0x00;
+  bytes[5] = 0x00;
+
+  log_tx_message(0x443, bytes, 6);
+  if (!can_bus->sendMessage(0x443, bytes, 6)) {
+    DEBUG_SERIAL.println("ERROR: Failed to send 0x443");
+  }
+
+  mux_state.count_443 = (mux_state.count_443 + 1) & 0x0F;
+}
+
+void PCSCan::Msg441() {
+  // VC_pcsInterface (0x441) - 50ms cycle, 2 message mux
+  // Theory so far:
+  //  SG_ VC_pcsInterfaceIndex M : 15|1@1+ (1,0) [0|0] "" Vector__XXX
+  //  SG_ VC_pcsResistanceFiltered m0 : 0|11@1+ (0.01,0) [0|655.35] "mOhms" Vector__XXX
+  //  SG_ VC_pcsLVMinVoltageLimit m0 : 20|4@1+ (1,0) [0|16] "V" Vector__XXX - not sure (range is supposed to be 0 65.535 so this isn't entire correct)
+  //  SG_ VC_pcsLVMaxVoltageLimit m0 : (tbd)
+  //  SG_ VC_pcsLVVoltageTarget m1 : 0|11@1+ (0.01,0) [0|65.535] "V" Vector__XXX
+  //  SG_ VC_pcsInterfaceCounter : 52|3@1+ (1,0) [0|0] "" Vector__XXX
+  //  SG_ VC_pcsInterfaceChecksum : 56|8@1+ (1,0) [0|0] "" Vector__XXX
+  // Byte 7:   VC_pcsInterfaceChecksum = (sum(bytes[0..6]) + 0x69) & 0xFF
+  //           Verified 100% match across 2313 frames from 3 production traces
+  if (can_bus == nullptr) return;
+
+  // On m0, I see [resistance] B6 C3 58 00 [counter] [checksum]
+  // On m1, I see [voltage target] 89 00 32 00 [counter] [checksum]
+  // let's build these messages with some nominal resistance
+  // voltage target will be our dcdc setpoint (14.5 is good for now to hardcode for testing)
+
+  uint8_t bytes[8] = {0};
+
+  // Byte 6: high nibble = counter (increments every 4 messages)
+  // Low nibble cycles through [0x0, 0x5, 0x8, 0xD] for positions 0-3 in the quad
+  const uint8_t low_nibble_options[] = {0x0, 0x5, 0x8, 0xD};
+  uint8_t low_nibble = low_nibble_options[mux_state.quad_msg_441];
+  bytes[6] = (mux_state.count_441 << 4) | low_nibble;
+
+  if (!mux_state.mux_441) {
+    // m0: voltage t arget page (matches ... B6 C3 58 00 for 14.62V traces)
+    // bits 0-10: LV target in 0.01V, bit 15: mux=1, bits 11-14 held at 0x8 from trace.
+    // float target_v = control_params.dcdc_voltage_v;
+    float target_v = 14.86f;  // Hardcoded for testing - adjust as needed
+    if (target_v < 0.0f) target_v = 0.0f;
+    if (target_v > 20.47f) target_v = 20.47f;  // 11-bit @ 0.01V
+
+    uint16_t target_raw = (uint16_t)(target_v * 100.0f + 0.5f);
+    uint16_t word01 = (uint16_t)(0x8000 | (0x8 << 12) | (target_raw & 0x07FF));
+
+    bytes[0] = word01 & 0xFF;
+    bytes[1] = (word01 >> 8) & 0xFF;
+    bytes[2] = 0x89;
+    bytes[3] = 0x00;
+    bytes[4] = 0x32;
+    bytes[5] = 0x00;
+  } else {
+    // m1: resistance page (matched to observed payload shape 89 00 32 00 ...)
+    const uint16_t resistance_raw = 0x017D;  // 3.81 mOhm @ 0.01 scaling
+    bytes[0] = resistance_raw & 0xFF;
+    bytes[1] = (resistance_raw >> 8) & 0x07;  // bit 15 (mux) stays 0
+    bytes[2] = 0xB6;
+    bytes[3] = 0xC3;
+    bytes[4] = 0x58;
+    bytes[5] = 0x00;
+  }
+
+  // VC_pcsInterfaceChecksum = (sum(bytes[0..6]) + 0x69) & 0xFF
+  uint16_t checksum = 0x69;
+  for (uint8_t i = 0; i < 7; i++) {
+    checksum += bytes[i];
+  }
+  bytes[7] = checksum & 0xFF;
+
+  log_tx_message(0x441, bytes, 8);
+  if (!can_bus->sendMessage(0x441, bytes, 8)) {
+    DEBUG_SERIAL.println("ERROR: Failed to send 0x441");
+  }
+
+  // Toggle mux for next call (strictly alternating)
+  mux_state.mux_441 = !mux_state.mux_441;
+
+  // Track position within 4-message cycle; increment counter only after 4 messages
+  mux_state.quad_msg_441++;
+  if (mux_state.quad_msg_441 >= 4) {
+    mux_state.quad_msg_441 = 0;
+    mux_state.count_441++;
+    if (mux_state.count_441 > 0x03) mux_state.count_441 = 0;
+  }
+}
+
+void PCSCan::Msg677()
+{
+  // VC_LVBMS_statusHigh (0x677) - 50ms cycle, mux 0-4
+  if (can_bus == nullptr) return;
+
+  uint8_t bytes[8] = {0};
+
+  // Mux cycles 0-4
+  bytes[0] = mux_state.mux_677 & 0x0F;
+
+  // Fill remaining bytes with simulated data (all zeros for now)
+  bytes[1] = 0;
+  bytes[2] = 0;
+  bytes[3] = 0;
+  bytes[4] = 0;
+  bytes[5] = 0;
+  bytes[6] = 0;
+  bytes[7] = 0;
+
+  log_tx_message(0x677, bytes, 8);
+  if (!can_bus->sendMessage(0x677, bytes, 8)) {
+    DEBUG_SERIAL.println("ERROR: Failed to send 0x677");
+  }
+
+  // Increment mux for next message (wraps at 4)
+  mux_state.mux_677++;
+  if (mux_state.mux_677 > 4) mux_state.mux_677 = 0;
+}
+
+void PCSCan::Msg718() {
+  if (can_bus == nullptr) return;
+
+  // Only send every 4th 50ms tick to achieve 200ms cycle
+  if (mux_state.count_718 < 3) {
+    mux_state.count_718++;
+    return;
+  }
+  mux_state.count_718 = 0;
+
+  uint8_t bytes[8] = {0};
+
+  // Mux cycles 0-4
+  bytes[0] = mux_state.mux_718 & 0x0F;
+
+  // Fill remaining bytes with simulated data (all zeros for now)
+  bytes[1] = 0;
+  bytes[2] = 0;
+  bytes[3] = 0;
+  bytes[4] = 0;
+  bytes[5] = 0;
+  bytes[6] = 0;
+  bytes[7] = 0;
+
+  log_tx_message(0x718, bytes, 8);
+  if (!can_bus->sendMessage(0x718, bytes, 8)) {
+    DEBUG_SERIAL.println("ERROR: Failed to send 0x718");
+  }
+
+  // Increment mux for next message (wraps at 4)
+  mux_state.mux_718++;
+  if (mux_state.mux_718 > 4) mux_state.mux_718 = 0;
+
+}
+
 
 // ==================== HELPERS ====================
 
@@ -1478,4 +1733,13 @@ float PCSCan::convert_temp_11bit(uint16_t raw) {
   }
 
   return (signed_val * 0.1f) + 40.0f;
+}
+
+void PCSCan::encode_voltage_to_3a1(uint8_t *bytes, float voltage_v) {
+  // Encode LV voltage into byte[3] with scale 0.25V
+  // Based on production Tesla trace analysis:
+  // Pattern A byte[3] varies with LV voltage (e.g., 0x35=13.25V, 0x3F=15.75V)
+  // Range: 0-255 * 0.25 = 0-63.75V
+  uint8_t raw_voltage = (uint8_t)(voltage_v / 0.25f);
+  bytes[3] = raw_voltage;
 }

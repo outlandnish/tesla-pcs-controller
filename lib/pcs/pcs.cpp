@@ -122,6 +122,7 @@ bool PCSController::charge_pin_enabled_ = false;
 bool PCSController::dcdc_pin_enabled_ = false;
 bool PCSController::can_enabled_ = false;
 bool PCSController::manual_override_ = false;
+uint16_t PCSController::can_startup_delay_ms_ = 0;
 
 // State machine
 PCSState PCSController::current_state_ = PCS_STATE_INIT;
@@ -207,6 +208,11 @@ bool PCSController::start_task() {
 void PCSController::update() {
   process_command_queue();
   PCSCan::process_messages();
+
+  // Decrement CAN startup delay (blocks message sends until it reaches 0)
+  if (can_startup_delay_ms_ > 0) {
+    can_startup_delay_ms_--;  // Decrement every 1ms (on timer tick)
+  }
 
   if (flag_10ms_) {
     flag_10ms_ = false;
@@ -451,6 +457,7 @@ void PCSController::process_command_queue() {
           DEBUG_SERIAL.printf("PCS: Manual PCS enable = %s\r\n", pcs_pin_enabled_ ? "ON" : "OFF");
           if (pcs_pin_enabled_ && !can_enabled_) {
             can_enabled_ = true;
+            can_startup_delay_ms_ = 25;  // Wait 25ms for CAN bus to be ready
             DEBUG_SERIAL.println("PCS: Auto-enabling CAN (PCS enabled)");
           }
         } else {
@@ -489,7 +496,7 @@ void PCSController::process_command_queue() {
 }
 
 void PCSController::send_10ms_messages() {
-  if (!can_enabled_) return;
+  if (!can_enabled_ || can_startup_delay_ms_ > 0) return;
   PCSCan::Msg13D();  // CP_chargeStatus - needed to prevent PCS_a023_cpMia
   PCSCan::Msg20A();  // HVP_contactorState (DBC: 10ms cycle)
   PCSCan::Msg22A();
@@ -497,22 +504,23 @@ void PCSController::send_10ms_messages() {
 }
 
 void PCSController::send_20ms_messages() {
-  if (!can_enabled_) return;
+  if (!can_enabled_ || can_startup_delay_ms_ > 0) return;
   PCSCan::Msg201();   // Unknown message (4-message cycle, ~1400ms total)
   PCSCan::Msg2E1();   // VCFRONT_status (DBC: 20ms) - simulated VCFRONT, reports PCSMia=0 DCDCNoop=0
 }
 
 void PCSController::send_50ms_messages() {
-  if (!can_enabled_) return;
+  if (!can_enabled_ || can_startup_delay_ms_ > 0) return;
   PCSCan::Msg221();   // VCFRONT_LVPowerState (DBC: 50ms) - simulated VCFRONT for EV conversion
   PCSCan::Msg545();
+  PCSCan::Msg441();   // VC_pcsInterface (trace: ~50ms, alternating mux pages)
   PCSCan::Msg261();   // VCFRONT_12VBatteryStatus (DBC: 100ms) - simulated VCFRONT for EV conversion
   PCSCan::Msg340();   // VCFRONT_alertMatrix (DBC: 100ms) - simulated VCFRONT with DCDC operational
   PCSCan::Msg3A1();   // VCFRONT_vehicleStatus (DBC: 100ms)
 }
 
 void PCSController::send_100ms_messages() {
-  if (!can_enabled_) return;
+  if (!can_enabled_ || can_startup_delay_ms_ > 0) return;
   PCSCan::Msg212();   // BMS_status (DBC: 100ms)
   PCSCan::Msg21D();   // CP_evseStatus (DBC: 100ms)
   PCSCan::Msg232();
@@ -523,11 +531,12 @@ void PCSController::send_100ms_messages() {
 }
 
 void PCSController::send_500ms_messages() {
-  if (!can_enabled_) return;
+  if (!can_enabled_ || can_startup_delay_ms_ > 0) return;
 
   static uint8_t ms1000_counter = 0;
 
   PCSCan::Msg333();   // UI_chargeRequest (DBC: 500ms)
+  PCSCan::Msg443();   // VC_pcsManagement (trace: 500ms, unrestricted LV limits)
 
   // Send 1000ms cycle messages every other 500ms call
   if (ms1000_counter == 0) {
@@ -866,7 +875,8 @@ void PCSController::run_state_machine() {
     case PCS_STATE_PRECHARGE:
       if (!can_enabled_) {
         can_enabled_ = true;
-        DEBUG_SERIAL.println("PCS: Starting CAN heartbeats");
+        can_startup_delay_ms_ = 25;  // Wait 25ms for CAN bus to be ready
+        DEBUG_SERIAL.println("PCS: Starting CAN heartbeats - startup delay 100ms");
       }
 
       if (!pcs_pin_enabled_) {
@@ -915,6 +925,7 @@ void PCSController::run_state_machine() {
       dcdc_pin_enabled_ = true;
       pcs_pin_enabled_ = true;
       can_enabled_ = true;
+      can_startup_delay_ms_ = 25;  // Wait 25ms for CAN bus to be ready
       current_mode_ = PCS_MODE_DCDC_ONLY;
       PCSCan::set_mode(PCS_MODE_DCDC_ONLY);
       PCSCan::set_charge_enable(false);

@@ -449,8 +449,15 @@ struct MuxState {
   bool mux_545;      // VCFRONT_LVPowerState alternates mux 0/1
   uint8_t count_545; // VCFRONT_LVPowerState counter
   uint8_t count_3a1; // VCFRONT_vehicleStatus counter
+  uint8_t count_441; // VC_pcsInterface counter (2-bit, 0-3, increments every 4 messages)
+  bool mux_441;
+  uint8_t quad_msg_441; // VC_pcsInterface message position within counter cycle (0-3)
+  uint8_t count_443; // VC_pcsManagement rolling metadata nibble (0-15)
   uint8_t mux_2c4;
   bool got_dci;
+  uint8_t mux_677;   // VC_LVBMS_statusHigh mux page (cycles 0-4)
+  uint8_t mux_718;   // VC_LVBMS_statusLow mux page (cycles 0-4)
+  uint8_t count_718; // VC_LVBMS_statusLow 200ms divider (send every 4th 50ms tick)
 };
 
 // ==================== PCS CAN TRANSPORT CLASS ====================
@@ -464,7 +471,7 @@ public:
   static void process_messages();
 
   // Process a single CAN frame
-  static void process_frame(uint32_t can_id, uint32_t data[2]);
+  static void process_frame(uint32_t can_id, uint32_t data[2], uint8_t len);
 
   // ==================== TX MESSAGES ====================
 
@@ -489,6 +496,10 @@ public:
   static void Msg3A1();   // DCDC voltage setpoint
   static void Msg3B2();   // BMS log message (multiplexed)
   static void Msg545();   // VCFRONT_LVPowerState
+  static void Msg443();   // VC_pcsManagement (500ms cycle, unrestricted limits)
+  static void Msg441();   // VC_pcsInterface (100ms cycle, mux 0x01/0x85)
+  static void Msg677();   // VC_LVBMS_statusHigh (50ms cycle, mux 0-4)
+  static void Msg718();   // VC_LVBMS_statusLow (200ms cycle, mux 0-4)
 
   // ==================== CONTROL SETTERS (for TX messages) ====================
 
@@ -513,7 +524,7 @@ private:
   static void handle224(uint32_t data[2]);  // DCDC status -> PCSController
   static void handle264(uint32_t data[2]);  // AC line status -> PCSController
   static void handle2A4(uint32_t data[2]);  // Temperature -> PCSController
-  static void handle2B4(uint32_t data[2]);  // DCDC bus status -> PCSController
+  static void handle2B4(uint32_t data[2], uint8_t dlc);  // DCDC bus status -> PCSController (supports DLC=5 and DLC=6 formats)
   static void handle2C4(uint32_t data[2]);  // Logging data -> PCSController
   static void handle3A4(uint32_t data[2]);  // Alert matrix -> PCSController
   static void handle3C4(uint32_t data[2]);  // PCS info -> PCSController
@@ -536,4 +547,5 @@ private:
 
   static uint8_t calc_checksum(uint8_t *data, uint16_t id);
   static float convert_temp_11bit(uint16_t raw);
+  static void encode_voltage_to_3a1(uint8_t *bytes, float voltage_v);
 };
