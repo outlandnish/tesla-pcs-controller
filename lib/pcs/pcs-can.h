@@ -54,7 +54,8 @@ struct ControlParams {
   float dcdc_voltage_v;           // DCDC output voltage setpoint (V)
   uint8_t ac_current_limit_a;     // AC current limit (A)
   uint8_t evse_limit_a;           // EVSE current limit (A)
-  uint8_t cable_limit;            // Cable limit code
+  uint8_t cable_limit;            // Cable current limit (A)
+  float charge_termination_pct;   // Charge termination SOC (%, used in 0x333)
 };
 
 // Charger status data (from message 0x204)
@@ -104,11 +105,151 @@ struct DCCurrentData {
   float total_a;                  // Total DC output current (A)
 };
 
+// HVP_pcsControl (0x22A) — HVP_pcsControlRequest enum
+enum HvpPcsControlRequest : uint8_t {
+  HVP_PCS_CTRL_SHUTDOWN  = 0,
+  HVP_PCS_CTRL_SUPPORT   = 1,
+  HVP_PCS_CTRL_PRECHARGE = 2,
+  HVP_PCS_CTRL_DISCHARGE = 3,
+};
+
+// HVP_contactorState (0x20A) — individual contactor state
+enum HvpContactorState : uint8_t {
+  CONTACTOR_STATE_SNA        = 0,
+  CONTACTOR_STATE_OPEN       = 1,
+  CONTACTOR_STATE_PRECHARGE  = 2,
+  CONTACTOR_STATE_BLOCKED    = 3,
+  CONTACTOR_STATE_PULLED_IN  = 4,
+  CONTACTOR_STATE_OPENING    = 5,
+  CONTACTOR_STATE_ECONOMIZED = 6,
+  CONTACTOR_STATE_WELDED     = 7,
+};
+
+// HVP_contactorState (0x20A) — contactor set state
+enum HvpContactorSetState : uint8_t {
+  CONTACTOR_SET_STATE_SNA              = 0,
+  CONTACTOR_SET_STATE_OPEN             = 1,
+  CONTACTOR_SET_STATE_CLOSING          = 2,
+  CONTACTOR_SET_STATE_BLOCKED          = 3,
+  CONTACTOR_SET_STATE_OPENING          = 4,
+  CONTACTOR_SET_STATE_CLOSED           = 5,
+  CONTACTOR_SET_STATE_PARTIAL_WELD     = 6,
+  CONTACTOR_SET_STATE_WELDED           = 7,
+  CONTACTOR_SET_STATE_POSITIVE_CLOSED  = 8,
+  CONTACTOR_SET_STATE_NEGATIVE_CLOSED  = 9,
+};
+
+// HVP_contactorState (0x20A) — HVIL status
+enum HvpHvilStatus : uint8_t {
+  HVIL_UNKNOWN         = 0,
+  HVIL_STATUS_OK       = 1,
+  HVIL_CURRENT_SOURCE_FAULT = 2,
+  HVIL_INTERNAL_OPEN_FAULT  = 3,
+  HVIL_VEHICLE_OPEN_FAULT   = 4,
+};
+
+// BMS_status (0x212) — BMS state / smStateRequest
+enum BmsState : uint8_t {
+  BMS_STANDBY    = 0,
+  BMS_DRIVE      = 1,
+  BMS_SUPPORT    = 2,
+  BMS_CHARGE     = 3,
+  BMS_FEIM       = 4,
+  BMS_CLEAR_FAULT = 5,
+  BMS_FAULT      = 6,
+  BMS_WELD       = 7,
+  BMS_TEST       = 8,
+  BMS_SNA        = 9,
+  BMS_DIAG       = 10,
+};
+
+// BMS_status (0x212) — contactor set state (BMS view)
+enum BmsContactorState : uint8_t {
+  BMS_CTRSET_SNA     = 0,
+  BMS_CTRSET_OPEN    = 1,
+  BMS_CTRSET_OPENING = 2,
+  BMS_CTRSET_CLOSING = 3,
+  BMS_CTRSET_CLOSED  = 4,
+  BMS_CTRSET_WELDED  = 5,
+  BMS_CTRSET_BLOCKED = 6,
+};
+
+// BMS_status (0x212) — UI charge status
+enum BmsUiChargeStatus : uint8_t {
+  BMS_DISCONNECTED     = 0,
+  BMS_NO_POWER         = 1,
+  BMS_ABOUT_TO_CHARGE  = 2,
+  BMS_CHARGING         = 3,
+  BMS_CHARGE_COMPLETE  = 4,
+  BMS_CHARGE_STOPPED   = 5,
+};
+
+// BMS_status (0x212) — HV state
+enum BmsHvState : uint8_t {
+  HV_DOWN          = 0,
+  HV_COMING_UP     = 1,
+  HV_GOING_DOWN    = 2,
+  HV_UP_FOR_DRIVE  = 3,
+  HV_UP_FOR_CHARGE = 4,
+  HV_UP_FOR_DC_CHARGE = 5,
+  HV_UP            = 6,
+};
+
+// CP_evseStatus (0x21D) — proximity
+enum CpProximity : uint8_t {
+  CHG_PROXIMITY_SNA         = 0,
+  CHG_PROXIMITY_DISCONNECTED = 1,
+  CHG_PROXIMITY_UNLATCHED   = 2,
+  CHG_PROXIMITY_LATCHED     = 3,
+};
+
+// CP_evseStatus (0x21D) — pilot state
+enum CpPilot : uint8_t {
+  CHG_PILOT_NONE        = 0,
+  CHG_PILOT_FAULTED     = 1,
+  CHG_PILOT_LINE_CHARGE = 2,
+  CHG_PILOT_FAST_CHARGE = 3,
+  CHG_PILOT_IDLE        = 4,
+};
+
+// CP_evseStatus (0x21D) — EVSE charge type (UI)
+enum CpEvseChargeType : uint8_t {
+  NO_CHARGER_PRESENT  = 0,
+  DC_CHARGER_PRESENT  = 1,
+  AC_CHARGER_PRESENT  = 2,
+};
+
+// CP_evseStatus (0x21D) — AC charge state
+enum CpAcChargeState : uint8_t {
+  AC_CHARGE_INACTIVE              = 0,
+  AC_CHARGE_CONNECTED_CHARGE_BLOCKED = 1,
+  AC_CHARGE_STANDBY               = 2,
+  AC_CHARGE_ENABLED               = 3,
+  AC_CHARGE_ONBOARD_CHARGER_SHUTDOWN = 4,
+  AC_CHARGE_VEH_SHUTDOWN          = 5,
+  AC_CHARGE_FAULT                 = 6,
+};
+
+// VCFRONT_vehicleStatus (0x3A1) — 12V status for drive
+enum Vcfront12vStatus : uint8_t {
+  NOT_READY_FOR_DRIVE_12V      = 0,
+  READY_FOR_DRIVE_12V          = 1,
+  EXIT_DRIVE_REQUESTED_12V     = 2,
+};
+
+// VCFRONT_sensors (0x321) — brake fluid level / washer fluid level
+enum VcfrontFluidLevel : uint8_t {
+  FLUID_SNA    = 0,
+  FLUID_LOW    = 1,
+  FLUID_NORMAL = 2,
+};
+
 // Message multiplexing state
 struct MuxState {
   bool mux_3b2;                   // Message 0x3B2 multiplex toggle
   bool mux_545;                   // Message 0x545 multiplex toggle
   uint8_t count_545;              // Message 0x545 counter (0-15)
+  uint8_t count_3a1;              // Message 0x3A1 vehicleStatusCounter (0-15)
   uint8_t mux_2c4;                // Message 0x2C4 multiplex ID
   bool backup_2c4;                // Message 0x2C4 backup mode flag
   bool got_dci;                   // DC current from 0x2C4 (vs 0x76C)
@@ -160,6 +301,7 @@ public:
   static void set_ac_current_limit(uint8_t limit_a) { control_params.ac_current_limit_a = limit_a; }
   static void set_evse_limit(uint8_t limit_a) { control_params.evse_limit_a = limit_a; }
   static void set_cable_limit(uint8_t limit) { control_params.cable_limit = limit; }
+  static void set_charge_termination_pct(float pct) { control_params.charge_termination_pct = pct; }
   static void set_charge_enable(bool enable) { charge_enable = enable; }
 
   // Struct-level status accessors (return references for efficient access)

@@ -41,7 +41,8 @@ ControlParams PCSCan::control_params = {
   .dcdc_voltage_v = UDCDC_DEFAULT,
   .ac_current_limit_a = IACLIM_DEFAULT,
   .evse_limit_a = 0,
-  .cable_limit = 0
+  .cable_limit = 0,
+  .charge_termination_pct = 80.0f
 };
 
 ChargerStatus PCSCan::charger_status = {
@@ -196,7 +197,9 @@ void PCSCan::handle204(uint32_t data[2]) {
 
 void PCSCan::handle224(uint32_t data[2]) {
   uint8_t* bytes = (uint8_t*)data;
-  dcdc_status.current_a = (((bytes[3] << 8 | bytes[2]) & 0xFFF) * 0.1f);
+  // PCS_dcdcMaxOutputCurrentAllowed: pos=29, w=12, scale=0.1
+  // bits29-40: byte3 bits5-7, byte4 bits0-7, byte5 bit0
+  dcdc_status.current_a = (((bytes[5] << 16 | bytes[4] << 8 | bytes[3]) >> 5) & 0xFFF) * 0.1f;
   dcdc_status.power_w = dcdc_status.current_a * voltage_data.lv_v;
 }
 
@@ -205,7 +208,8 @@ void PCSCan::handle264(uint32_t data[2]) {
   ac_status.current_limit_a = (((bytes[5] << 8 | bytes[4]) & 0x3ff) * 0.1f);
   ac_status.power_kw = ((bytes[3]) * 0.1f);
   ac_status.voltage_v = (((bytes[1] << 8 | bytes[0]) & 0x3FFF) * 0.033f);
-  ac_status.current_a = (((bytes[2] << 9 | bytes[1]) >> 7) * 0.1f);
+  // PCS_chgLineCurrent: pos=14, w=9, scale=0.1 — bits14-22: byte1 bits6-7, byte2 bits0-6
+  ac_status.current_a = (((bytes[2] << 2 | bytes[1] >> 6) & 0x1FF) * 0.1f);
 }
 
 void PCSCan::handle2A4(uint32_t data[2]) {
@@ -364,13 +368,18 @@ void PCSCan::Msg13D() {
 void PCSCan::Msg20A() {
   if (can_bus == nullptr) return;
 
+  // HVP_contactorState — signal layout from Model3_ETH.compact.json
+  // Contactor states: neg@0(3b), pos@3(3b), packSetState@8(4b),
+  //   packCtrsClosingAllowed@35(1b), dcLinkAllowedToEnergize@36(1b), hvilStatus@40(4b)
+  uint64_t word = 0;
+  word |= (uint64_t)CONTACTOR_STATE_ECONOMIZED << 0;   // packContNegativeState
+  word |= (uint64_t)CONTACTOR_STATE_ECONOMIZED << 3;   // packContPositiveState
+  word |= (uint64_t)CONTACTOR_SET_STATE_CLOSED << 8;   // packContactorSetState
+  word |= (uint64_t)1 << 35;  // packCtrsClosingAllowed
+  word |= (uint64_t)1 << 36;  // dcLinkAllowedToEnergize
+  word |= (uint64_t)HVIL_STATUS_OK << 40;              // hvilStatus
   uint8_t bytes[6];
-  bytes[0] = 0xF6;
-  bytes[1] = 0x15;
-  bytes[2] = 0x09;
-  bytes[3] = 0x82;
-  bytes[4] = 0x18;
-  bytes[5] = 0x01;
+  for (int i = 0; i < 6; i++) bytes[i] = (word >> (8 * i)) & 0xFF;
   if (!can_bus->sendMessage(0x20A, bytes, 6)) {
     DEBUG_SERIAL.println("ERROR: Failed to send 0x20A");
   }
@@ -379,15 +388,22 @@ void PCSCan::Msg20A() {
 void PCSCan::Msg212() {
   if (can_bus == nullptr) return;
 
+  // BMS_status — signal layout from Model3_ETH.compact.json
+  // hvacPowerRequest@0, updateAllowed@4, pcsPwmEnabled@7,
+  // contactorState@8(3b), uiChargeStatus@11(3b), hvState@16(3b),
+  // chargeRequest@29, state@32(4b), smStateRequest@56(4b)
+  uint64_t word = 0;
+  word |= (uint64_t)1 << 0;                           // hvacPowerRequest
+  word |= (uint64_t)1 << 4;                           // updateAllowed
+  word |= (uint64_t)1 << 7;                           // pcsPwmEnabled
+  word |= (uint64_t)BMS_CTRSET_CLOSED << 8;           // contactorState
+  word |= (uint64_t)BMS_CHARGING << 11;               // uiChargeStatus
+  word |= (uint64_t)HV_UP_FOR_CHARGE << 16;           // hvState
+  word |= (uint64_t)1 << 29;                          // chargeRequest
+  word |= (uint64_t)BMS_CHARGE << 32;                 // state
+  word |= (uint64_t)BMS_CHARGE << 56;                 // smStateRequest
   uint8_t bytes[8];
-  bytes[0] = 0xB9;
-  bytes[1] = 0x1C;
-  bytes[2] = 0x94;
-  bytes[3] = 0xAD;
-  bytes[4] = 0xC3;
-  bytes[5] = 0x15;
-  bytes[6] = 0x06;
-  bytes[7] = 0x63;
+  for (int i = 0; i < 8; i++) bytes[i] = (word >> (8 * i)) & 0xFF;
   log_tx_message(0x212, bytes, 8);
   if (!can_bus->sendMessage(0x212, bytes, 8)) {
     DEBUG_SERIAL.println("ERROR: Failed to send 0x212");
@@ -397,15 +413,19 @@ void PCSCan::Msg212() {
 void PCSCan::Msg21D() {
   if (can_bus == nullptr) return;
 
+  // CP_evseStatus — signal layout from Model3_ETH.compact.json
+  // evseAccept@0, proximity@2(2b), pilot@4(3b), pilotCurrent@8(8b,scale=0.5),
+  // cableCurrentLimit@24(7b), evseChargeType_UI@38(2b), acChargeState@53(3b)
+  uint64_t word = 0;
+  word |= (uint64_t)1 << 0;                                           // evseAccept
+  word |= (uint64_t)CHG_PROXIMITY_LATCHED << 2;                       // proximity
+  word |= (uint64_t)CHG_PILOT_LINE_CHARGE << 4;                       // pilot
+  word |= (uint64_t)(uint8_t)(control_params.evse_limit_a / 0.5f) << 8;  // pilotCurrent
+  word |= (uint64_t)(control_params.cable_limit & 0x7F) << 24;        // cableCurrentLimit
+  word |= (uint64_t)AC_CHARGER_PRESENT << 38;                         // evseChargeType_UI
+  word |= (uint64_t)AC_CHARGE_ENABLED << 53;                          // acChargeState
   uint8_t bytes[8];
-  bytes[0] = 0x2D;
-  bytes[1] = control_params.evse_limit_a * 2;
-  bytes[2] = 0x00;
-  bytes[3] = control_params.cable_limit;
-  bytes[4] = 0x80;
-  bytes[5] = 0x00;
-  bytes[6] = 0x60;
-  bytes[7] = 0x10;
+  for (int i = 0; i < 8; i++) bytes[i] = (word >> (8 * i)) & 0xFF;
   if (!can_bus->sendMessage(0x21D, bytes, 8)) {
     DEBUG_SERIAL.println("ERROR: Failed to send 0x21D");
   }
@@ -414,11 +434,19 @@ void PCSCan::Msg21D() {
 void PCSCan::Msg22A() {
   if (can_bus == nullptr) return;
 
+  // HVP_pcsControl — signal layout from Model3_ETH.compact.json
+  // dcLinkVoltageRequest@0(16b,scale=0.1,signed), pcsControlRequest@16(2b),
+  // pcsChargeHwEnabled@18(1b), pcsDcdcHwEnabled@19(1b)
+  bool charge_hw = (current_mode == PCS_MODE_CHARGE_ONLY || current_mode == PCS_MODE_CHARGE_DCDC);
+  bool dcdc_hw   = (current_mode == PCS_MODE_DCDC_ONLY   || current_mode == PCS_MODE_CHARGE_DCDC);
+  HvpPcsControlRequest ctrl = (current_mode == PCS_MODE_OFF) ? HVP_PCS_CTRL_SHUTDOWN : HVP_PCS_CTRL_SUPPORT;
+  int16_t v_raw = (int16_t)(control_params.hv_voltage_v / 0.1f);
+  uint32_t word = (uint16_t)v_raw;
+  word |= (uint32_t)ctrl << 16;
+  word |= (uint32_t)(charge_hw ? 1 : 0) << 18;
+  word |= (uint32_t)(dcdc_hw ? 1 : 0) << 19;
   uint8_t bytes[4];
-  bytes[0] = 0x00;
-  bytes[1] = 0x00;
-  bytes[2] = (control_params.hv_voltage_v & 0xF) << 4 | current_mode;
-  bytes[3] = (control_params.hv_voltage_v >> 4) & 0xFF;
+  for (int i = 0; i < 4; i++) bytes[i] = (word >> (8 * i)) & 0xFF;
   log_tx_message(0x22A, bytes, 4);
   if (!can_bus->sendMessage(0x22A, bytes, 4)) {
     DEBUG_SERIAL.println("ERROR: Failed to send 0x22A");
@@ -445,13 +473,13 @@ void PCSCan::Msg232() {
 void PCSCan::Msg23D() {
   if (can_bus == nullptr) return;
 
+  // CP_chargeStatus — not in Model3_ETH.compact.json; layout from pcs_send.py (confirmed working):
+  // hvChargeStatus@0(3b): 5=CP_CHARGE_ENABLED, acChargeCurrentLimit@8(8b,scale=0.5)
+  uint32_t word = 0;
+  word |= 5 << 0;  // hvChargeStatus=CP_CHARGE_ENABLED
+  word |= (uint32_t)(uint8_t)(control_params.ac_current_limit_a / 0.5f) << 8;
   uint8_t bytes[4];
-  // 0x05 = charger enabled, 0x0A = charger disabled (per old firmware comments)
-  if (charge_enable) bytes[0] = 0x05;
-  if (!charge_enable) bytes[0] = 0x0A;
-  bytes[1] = control_params.ac_current_limit_a * 2;
-  bytes[2] = 0xFF;
-  bytes[3] = 0x0F;
+  for (int i = 0; i < 4; i++) bytes[i] = (word >> (8 * i)) & 0xFF;
   if (!can_bus->sendMessage(0x23D, bytes, 4)) {
     DEBUG_SERIAL.println("ERROR: Failed to send 0x23D");
   }
@@ -460,15 +488,8 @@ void PCSCan::Msg23D() {
 void PCSCan::Msg25D() {
   if (can_bus == nullptr) return;
 
-  uint8_t bytes[8];
-  bytes[0] = 0xD9;
-  bytes[1] = 0x8C;
-  bytes[2] = 0x01;
-  bytes[3] = 0xB5;
-  bytes[4] = 0x4A;
-  bytes[5] = 0xC1;
-  bytes[6] = 0x0A;
-  bytes[7] = 0xE0;
+  // Fixed payload confirmed working in pcs_send.py
+  uint8_t bytes[8] = { 0xD8, 0x8C, 0x01, 0xB5, 0x4A, 0xC1, 0x0A, 0xE0 };
   log_tx_message(0x25D, bytes, 8);
   if (!can_bus->sendMessage(0x25D, bytes, 8)) {
     DEBUG_SERIAL.println("ERROR: Failed to send 0x25D");
@@ -527,11 +548,16 @@ void PCSCan::Msg321() {
 void PCSCan::Msg333() {
   if (can_bus == nullptr) return;
 
+  // UI_chargeRequest — signal layout from Model3_ETH.compact.json
+  // chargeEnableRequest@2(1b), acChargeCurrentLimit@8(7b,amps integer),
+  // chargeTerminationPct@16(10b,scale=0.1)
+  uint16_t term_raw = (uint16_t)(control_params.charge_termination_pct / 0.1f);
+  uint32_t word = 0;
+  word |= (uint32_t)1 << 2;                                          // chargeEnableRequest
+  word |= (uint32_t)(control_params.ac_current_limit_a & 0x7F) << 8; // acChargeCurrentLimit
+  word |= (uint32_t)(term_raw & 0x3FF) << 16;                        // chargeTerminationPct
   uint8_t bytes[4];
-  bytes[0] = 0x04;
-  bytes[1] = 0x30;
-  bytes[2] = 0x29;
-  bytes[3] = 0x07;
+  for (int i = 0; i < 4; i++) bytes[i] = (word >> (8 * i)) & 0xFF;
   log_tx_message(0x333, bytes, 4);
   if (!can_bus->sendMessage(0x333, bytes, 4)) {
     DEBUG_SERIAL.println("ERROR: Failed to send 0x333");
@@ -541,16 +567,24 @@ void PCSCan::Msg333() {
 void PCSCan::Msg3A1() {
   if (can_bus == nullptr) return;
 
-  uint16_t dcdc_spnt = control_params.dcdc_voltage_v * 100.0f;
+  // VCFRONT_vehicleStatus — signal layout from Model3_ETH.compact.json
+  // bmsHvChargeEnable@0, inAccessoryPlus(accPlusAvailable)@9, 12vStatusForDrive@14(2b),
+  // pcs12vVoltageTarget@16(11b,scale=0.01), vehicleStatusCounter@52(4b),
+  // vehicleStatusChecksum@56(8b) = sum(bytes[0:7]) & 0xFF
+  uint16_t v_raw = (uint16_t)(control_params.dcdc_voltage_v / 0.01f) & 0x7FF;
+  uint64_t word = 0;
+  word |= (uint64_t)1 << 0;                                    // bmsHvChargeEnable
+  word |= (uint64_t)1 << 9;                                    // accPlusAvailable
+  word |= (uint64_t)READY_FOR_DRIVE_12V << 14;                 // 12vStatusForDrive
+  word |= (uint64_t)v_raw << 16;                               // pcs12vVoltageTarget
+  word |= (uint64_t)(mux_state.count_3a1 & 0xF) << 52;        // vehicleStatusCounter
   uint8_t bytes[8];
-  bytes[0] = 0x09;
-  bytes[1] = 0x62;
-  bytes[2] = dcdc_spnt & 0xFF;
-  bytes[3] = ((dcdc_spnt >> 8) | 0x99);
-  bytes[4] = 0x08;
-  bytes[5] = 0x2C;
-  bytes[6] = 0x12;
-  bytes[7] = 0x5A;
+  for (int i = 0; i < 7; i++) bytes[i] = (word >> (8 * i)) & 0xFF;
+  bytes[7] = 0;
+  uint8_t csum = 0;
+  for (int i = 0; i < 7; i++) csum += bytes[i];
+  bytes[7] = csum;
+  mux_state.count_3a1 = (mux_state.count_3a1 + 1) & 0xF;
   log_tx_message(0x3A1, bytes, 8);
   if (!can_bus->sendMessage(0x3A1, bytes, 8)) {
     DEBUG_SERIAL.println("ERROR: Failed to send 0x3A1");
@@ -640,8 +674,8 @@ uint8_t PCSCan::calc_checksum(uint8_t *bytes, uint16_t id) {
 }
 
 int16_t PCSCan::process_temp(uint16_t in_val) {
-  int16_t value = in_val & 0x3ff;
-  if (in_val & 0x400) value -= 0x3ff;
-  value = value * 0.1f + 40;
-  return value;
+  // 11-bit signed, scale=0.1, offset=40 (PCS_thermalStatus signals)
+  int16_t value = in_val & 0x3FF;
+  if (in_val & 0x400) value -= 0x400;
+  return (int16_t)(value * 0.1f + 40);
 }
