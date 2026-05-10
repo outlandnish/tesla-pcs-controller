@@ -68,7 +68,8 @@ struct ChargerStatus {
 
 // DCDC status data (from message 0x224)
 struct DCDCStatus {
-  float current_a;                // DCDC output current (A)
+  float current_a;                // DCDC output current (A) — from 0x2B4
+  float max_current_a;            // DCDC max allowed output current (A) — from 0x224
   float power_w;                  // DCDC output power (W)
 };
 
@@ -250,9 +251,8 @@ struct MuxState {
   bool mux_545;                   // Message 0x545 multiplex toggle
   uint8_t count_545;              // Message 0x545 counter (0-15)
   uint8_t count_3a1;              // Message 0x3A1 vehicleStatusCounter (0-15)
-  uint8_t mux_2c4;                // Message 0x2C4 multiplex ID
-  bool backup_2c4;                // Message 0x2C4 backup mode flag
-  bool got_dci;                   // DC current from 0x2C4 (vs 0x76C)
+  uint8_t mux_2c4;                // Message 0x2C4 current mux ID
+  bool got_dci;                   // DC current received from 0x2C4 (vs 0x76C fallback)
 };
 
 class PCSCan {
@@ -287,7 +287,8 @@ public:
   static void handle224(uint32_t data[2]);  // DCDC data
   static void handle264(uint32_t data[2]);  // AC line status
   static void handle2A4(uint32_t data[2]);  // Temperature data
-  static void handle2C4(uint32_t data[2]);  // Voltage log (multiplexed)
+  static void handle2B4(uint32_t data[2]);  // PCS_dcdcRailStatus (HV/LV voltages, LV current)
+  static void handle2C4(uint32_t data[2]);  // PCS_logging (multiplexed)
   static void handle3A4(uint32_t data[2]);  // Alert page
   static void handle424(uint32_t data[2]);  // Alert data
   static void handle504(uint32_t data[2]);  // Boot ID

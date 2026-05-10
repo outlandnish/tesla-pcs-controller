@@ -54,6 +54,7 @@ ChargerStatus PCSCan::charger_status = {
 
 DCDCStatus PCSCan::dcdc_status = {
   .current_a = 0.0f,
+  .max_current_a = 0.0f,
   .power_w = 0.0f
 };
 
@@ -91,8 +92,8 @@ MuxState PCSCan::mux_state = {
   .mux_3b2 = false,
   .mux_545 = false,
   .count_545 = 0,
+  .count_3a1 = 0,
   .mux_2c4 = 0,
-  .backup_2c4 = false,
   .got_dci = false
 };
 
@@ -176,6 +177,7 @@ void PCSCan::process_frame(uint32_t can_id, uint32_t data[2]) {
     case 0x224: handle224(data); break;
     case 0x264: handle264(data); break;
     case 0x2A4: handle2A4(data); break;
+    case 0x2B4: handle2B4(data); break;
     case 0x2C4: handle2C4(data); break;
     case 0x3A4: handle3A4(data); break;
     case 0x424: handle424(data); break;
@@ -199,8 +201,7 @@ void PCSCan::handle224(uint32_t data[2]) {
   uint8_t* bytes = (uint8_t*)data;
   // PCS_dcdcMaxOutputCurrentAllowed: pos=29, w=12, scale=0.1
   // bits29-40: byte3 bits5-7, byte4 bits0-7, byte5 bit0
-  dcdc_status.current_a = (((bytes[5] << 16 | bytes[4] << 8 | bytes[3]) >> 5) & 0xFFF) * 0.1f;
-  dcdc_status.power_w = dcdc_status.current_a * voltage_data.lv_v;
+  dcdc_status.max_current_a = (((bytes[5] << 16 | bytes[4] << 8 | bytes[3]) >> 5) & 0xFFF) * 0.1f;
 }
 
 void PCSCan::handle264(uint32_t data[2]) {
@@ -227,31 +228,34 @@ void PCSCan::handle2A4(uint32_t data[2]) {
 
 void PCSCan::handle2C4(uint32_t data[2]) {
   uint8_t* bytes = (uint8_t*)data;
-  mux_state.mux_2c4 = (bytes[0]);
+  // PCS_logging — PCS_logMessageSelect @0(5b) selects mux payload
+  uint8_t mux = bytes[0] & 0x1F;
+  mux_state.mux_2c4 = mux;
 
-  if ((mux_state.mux_2c4 == 0xE6) || (mux_state.mux_2c4 == 0xC6)) {
-    voltage_data.hv_v = (((bytes[3] << 8 | bytes[2]) & 0xFFF) * 0.146484f);
-    voltage_data.lv_v = ((((bytes[1] << 9 | bytes[0]) >> 6)) * 0.0390625f);
-    mux_state.backup_2c4 = false;
-  }
-  else if ((mux_state.mux_2c4 == 0x04) && (mux_state.backup_2c4)) {
-    voltage_data.hv_v = ((((bytes[7] << 8 | bytes[6]) >> 3) & 0xFFF) * 0.146484f);
-  }
-
-  mux_state.mux_2c4 = (bytes[0] & 0x1F);
-  if (mux_state.mux_2c4 == 0x00) {
-    dc_current_data.phase_a_a = ((bytes[4]) * 0.1f);
+  // mux 0=PHA, 1=PHB, 2=PHC: chgPhXOutputI @32(8b, scale=0.1)
+  if (mux == 0x00) {
+    dc_current_data.phase_a_a = bytes[4] * 0.1f;
     mux_state.got_dci = true;
-  }
-  else if (mux_state.mux_2c4 == 0x01) {
-    dc_current_data.phase_b_a = ((bytes[4]) * 0.1f);
+  } else if (mux == 0x01) {
+    dc_current_data.phase_b_a = bytes[4] * 0.1f;
     mux_state.got_dci = true;
-  }
-  else if (mux_state.mux_2c4 == 0x02) {
-    dc_current_data.phase_c_a = ((bytes[4]) * 0.1f);
+  } else if (mux == 0x02) {
+    dc_current_data.phase_c_a = bytes[4] * 0.1f;
     mux_state.got_dci = true;
   }
   dc_current_data.total_a = dc_current_data.phase_a_a + dc_current_data.phase_b_a + dc_current_data.phase_c_a;
+}
+
+void PCSCan::handle2B4(uint32_t data[2]) {
+  uint8_t* bytes = (uint8_t*)data;
+  // PCS_dcdcRailStatus — signal layout from Model3_ETH.compact.json
+  // PCS_dcdcLvBusVolt:      pos=0,  w=10, scale=0.0390625
+  // PCS_dcdcHvBusVolt:      pos=10, w=12, scale=0.146484375
+  // PCS_dcdcLvOutputCurrent:pos=24, w=12, scale=0.1
+  voltage_data.lv_v  = ((bytes[1] << 8 | bytes[0]) & 0x3FF) * 0.0390625f;
+  voltage_data.hv_v  = (((bytes[2] << 8 | bytes[1]) >> 2) & 0xFFF) * 0.146484375f;
+  dcdc_status.current_a = (((bytes[4] << 8 | bytes[3]) >> 0) & 0xFFF) * 0.1f;
+  dcdc_status.power_w = dcdc_status.current_a * voltage_data.lv_v;
 }
 
 void PCSCan::handle3A4(uint32_t data[2]) {
