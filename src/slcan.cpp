@@ -195,6 +195,23 @@ static void applyEnablesFromTxFrame(const CAN_FRAME& f) {
   digitalWrite(PIN_DCDC_ENABLE,   dcdcOn   ? LOW : HIGH);
 }
 
+// Diagnostic control frame: extended ID 0x1FFF0000 with explicit enable bytes.
+//   byte[0]: PCS_ENABLE      (nonzero = on)        - active-high
+//   byte[1]: CHARGE_ENABLE   (nonzero = on)        - active-low pin
+//   byte[2]: DCDC_ENABLE     (nonzero = on)        - active-low pin
+// Returns true if the frame was consumed (do not transmit on the bus).
+static bool handleDiagControlFrame(const CAN_FRAME& f) {
+  if (!f.extended || f.rtr) return false;
+  if (f.id != 0x1FFF0000 || f.length < 3) return false;
+  bool pcsOn    = f.data.uint8[0] != 0;
+  bool chargeOn = f.data.uint8[1] != 0;
+  bool dcdcOn   = f.data.uint8[2] != 0;
+  digitalWrite(PIN_PCS_ENABLE,    pcsOn    ? HIGH : LOW);
+  digitalWrite(PIN_CHARGE_ENABLE, chargeOn ? LOW  : HIGH);
+  digitalWrite(PIN_DCDC_ENABLE,   dcdcOn   ? LOW  : HIGH);
+  return true;
+}
+
 // Parse and send a tx command. Returns true on success.
 // kind: 't'=std data, 'T'=ext data, 'r'=std rtr, 'R'=ext rtr
 static bool handleTxCommand(char kind, const char* args, size_t argLen) {
@@ -229,6 +246,13 @@ static bool handleTxCommand(char kind, const char* args, size_t argLen) {
   }
 
   if (!channelOpen || listenOnly) return false;
+
+  // Intercept diagnostic control frame - apply enables locally, don't TX.
+  if (handleDiagControlFrame(frame)) {
+    lastTxBlinkMs = millis();
+    return true;
+  }
+
   bool ok = slcanBus.sendFrame(frame);
   if (ok) {
     txFrameCount++;

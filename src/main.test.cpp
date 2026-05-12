@@ -38,7 +38,7 @@ void setup() {
 
   // Configure outputs
   pinMode(PIN_PCS_ENABLE, OUTPUT);
-  digitalWrite(PIN_PCS_ENABLE, HIGH);  // Disable PCS (active low)
+  digitalWrite(PIN_PCS_ENABLE, LOW);  // Disable PCS (active high)
 
   pinMode(PIN_CHARGE_ENABLE, OUTPUT);
   digitalWrite(PIN_CHARGE_ENABLE, HIGH);  // Disable Charger (active low)
@@ -84,8 +84,8 @@ void stateMachine() {
         // Skip ENABLE state (no precharge, no hvena_out)
         // Go directly to activating PCS and charger/DCDC
         Debug.println("Activating PCS...");
-        digitalWrite(PIN_PCS_ENABLE, LOW);  // Enable PCS (active low)
-        Debug.println("  PIN_PCS_ENABLE = LOW (PCS enabled)");
+        digitalWrite(PIN_PCS_ENABLE, HIGH);  // Enable PCS (active high)
+        Debug.println("  PIN_PCS_ENABLE = HIGH (PCS enabled)");
         
         Debug.println("Activating Charger...");
         digitalWrite(PIN_CHARGE_ENABLE, LOW);  // Enable Charger (active low)
@@ -156,12 +156,12 @@ void stateMachine() {
       if (timeInState >= STOP_TIME_MS) {
         Debug.println("Shutdown delay complete - disabling all outputs");
         
-        digitalWrite(PIN_PCS_ENABLE, HIGH);     // Disable PCS
-        digitalWrite(PIN_CHARGE_ENABLE, HIGH);  // Disable Charger  
+        digitalWrite(PIN_PCS_ENABLE, LOW);      // Disable PCS (active high)
+        digitalWrite(PIN_CHARGE_ENABLE, HIGH);  // Disable Charger
         digitalWrite(PIN_DCDC_ENABLE, HIGH);    // Disable DCDC
         digitalWrite(PIN_LED, LOW);             // LED off
-        
-        Debug.println("  PIN_PCS_ENABLE = HIGH (PCS disabled)");
+
+        Debug.println("  PIN_PCS_ENABLE = LOW (PCS disabled)");
         Debug.println("  PIN_CHARGE_ENABLE = HIGH (Charger disabled)");
         Debug.println("  PIN_DCDC_ENABLE = HIGH (DCDC disabled)");
         
